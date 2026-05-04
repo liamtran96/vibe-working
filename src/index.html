@@ -12,14 +12,19 @@
       <header>
         <h1>Repo Launcher</h1>
         <div class="actions">
-          <button id="addRepo" class="btn btn-primary">+ Add Repo</button>
+          <button id="addRepo" class="btn btn-primary">Add repository</button>
         </div>
       </header>
 
       <div class="toolbar">
         <div class="search-bar">
-          <span class="search-icon">&#128269;</span>
-          <input type="text" id="searchInput" placeholder="Search repos..." autocomplete="off" />
+          <span class="search-icon">
+            <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+              <circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M11 11l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <input type="text" id="searchInput" placeholder="Search repositories" autocomplete="off" />
         </div>
         <div class="filter-group">
           <button class="filter-btn active" data-filter="all">All</button>
@@ -34,8 +39,8 @@
         <!-- Repos will be rendered here -->
       </div>
       <div id="emptyState" class="empty-state">
-        <p>No repositories added yet.</p>
-        <p>Click "Add Repo" to add a repository.</p>
+        <p>Nothing here yet</p>
+        <p>Add a repository to get started.</p>
       </div>
     </main>
   </div>
