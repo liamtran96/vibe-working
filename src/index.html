@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repo Launcher</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <div class="sticky-top">
+      <header>
+        <h1>Repo Launcher</h1>
+        <div class="actions">
+          <button id="addRepo" class="btn btn-primary">+ Add Repo</button>
+        </div>
+      </header>
+
+      <div class="toolbar">
+        <div class="search-bar">
+          <span class="search-icon">&#128269;</span>
+          <input type="text" id="searchInput" placeholder="Search repos..." autocomplete="off" />
+        </div>
+        <div class="filter-group">
+          <button class="filter-btn active" data-filter="all">All</button>
+          <button class="filter-btn" data-filter="running">Running</button>
+          <button class="filter-btn" data-filter="stopped">Stopped</button>
+        </div>
+      </div>
+    </div>
+
+    <main>
+      <div id="repoList" class="repo-list">
+        <!-- Repos will be rendered here -->
+      </div>
+      <div id="emptyState" class="empty-state">
+        <p>No repositories added yet.</p>
+        <p>Click "Add Repo" to add a repository.</p>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

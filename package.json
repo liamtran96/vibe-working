@@ -1,0 +1,17 @@
+{
+  "name": "repo-launcher",
+  "version": "1.0.0",
+  "description": "A simple repo launcher for Windows",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "png-to-ico": "^3.0.1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  }
+}

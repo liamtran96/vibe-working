@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schemas.tauri.app/v2/config",
+  "identifier": "default",
+  "description": "Default capabilities for the app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-open"
+  ]
+}
