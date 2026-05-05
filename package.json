@@ -1,7 +1,7 @@
 {
-  "name": "repo-launcher",
+  "name": "vibe-working",
   "version": "1.0.0",
-  "description": "A simple repo launcher for Windows",
+  "description": "Vibe Working — a developer workspace for repos and notes",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",

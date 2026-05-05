@@ -7,6 +7,78 @@ document.addEventListener('DOMContentLoaded', async () => {
     return;
   }
 
+  initRepos();
+  initRouter();
+  initSidebarToggle();
+  initGlobalShortcuts();
+
+  console.log('App initialized successfully');
+});
+
+let notesModulePromise = null;
+function loadNotesModule() {
+  if (!notesModulePromise) {
+    notesModulePromise = import('./notes.js');
+  }
+  return notesModulePromise;
+}
+
+function initGlobalShortcuts() {
+  window.addEventListener('keydown', async e => {
+    const meta = e.ctrlKey || e.metaKey;
+    if (meta && e.key === 'k') {
+      e.preventDefault();
+      document.querySelector('.nav-item[data-view="notes"]')?.click();
+      const mod = await loadNotesModule();
+      await mod.initNotes?.();
+      mod.openCommandPalette?.();
+    }
+  });
+}
+
+function initSidebarToggle() {
+  const app = document.querySelector('.app');
+  const btn = document.getElementById('sidebarToggle');
+  const SAVED = localStorage.getItem('sidebarCollapsed') === '1';
+  if (SAVED) app.classList.add('sidebar-collapsed');
+  btn.addEventListener('click', () => {
+    app.classList.toggle('sidebar-collapsed');
+    localStorage.setItem('sidebarCollapsed', app.classList.contains('sidebar-collapsed') ? '1' : '0');
+  });
+}
+
+// ============================================================
+// View router
+// ============================================================
+
+function initRouter() {
+  const navItems = document.querySelectorAll('.nav-item');
+
+  function setView(view) {
+    navItems.forEach(b => {
+      b.classList.toggle('active', b.dataset.view === view);
+    });
+    document.getElementById('view-repos').classList.toggle('hidden', view !== 'repos');
+    document.getElementById('view-notes').classList.toggle('hidden', view !== 'notes');
+    document.querySelector('.view-host').scrollTop = 0;
+
+    if (view === 'notes') {
+      loadNotesModule().then(m => m.initNotes()).catch(err => {
+        console.error('Failed to load notes module', err);
+      });
+    }
+  }
+
+  navItems.forEach(b => {
+    b.addEventListener('click', () => setView(b.dataset.view));
+  });
+}
+
+// ============================================================
+// Repos view
+// ============================================================
+
+function initRepos() {
   const { invoke } = window.__TAURI__.core;
   const { open } = window.__TAURI__.dialog;
 
@@ -38,7 +110,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function parseCommandsInput(input) {
-    // Format: "label=command, label2=command2" or comma-separated labels -> "npm run <label>"
     return input
       .split(',')
       .map(s => s.trim())
@@ -101,21 +172,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         : '';
 
       const runBtn = isRunning
-        ? `<button class="btn btn-danger btn-sm" onclick="stopRepo('${repo.id}')">Stop</button>`
+        ? `<button class="btn btn-danger btn-sm" data-action="stop">Stop</button>`
         : isCustom
-          ? `<button class="btn btn-success btn-sm" onclick="runCustomFromCard('${repo.id}')">Run</button>`
-          : `<button class="btn btn-success btn-sm" onclick="runFromCard('${repo.id}')">Run</button>`;
+          ? `<button class="btn btn-success btn-sm" data-action="run-custom">Run</button>`
+          : `<button class="btn btn-success btn-sm" data-action="run">Run</button>`;
 
       const runControl = `<div class="run-control">
-          <select class="cmd-select" ${isRunning ? 'disabled' : ''} onchange="selectCommand('${repo.id}', this.value)">${options}</select>
+          <select class="cmd-select" ${isRunning ? 'disabled' : ''} data-action="select-command">${options}</select>
           ${customInput}
           ${runBtn}
         </div>`;
 
-      const emptyCommands = '';
-
       return `
-        <div class="repo-card" data-id="${repo.id}">
+        <div class="repo-card" data-id="${escapeAttr(repo.id)}">
           <div class="repo-header">
             <div class="repo-info">
               <div class="repo-name">${escapeHtml(repo.name)}</div>
@@ -126,16 +195,14 @@ document.addEventListener('DOMContentLoaded', async () => {
               ${isRunning ? `Running${activeLabel ? ': ' + escapeHtml(activeLabel) : ''}` : 'Stopped'}
             </div>
           </div>
-          ${emptyCommands}
           ${runControl}
           <div class="repo-actions">
             ${vscodeOpen[repo.id]
-              ? `<button class="btn btn-danger btn-sm" onclick="closeVSCode('${repo.id}')">Close VS Code</button>`
-              : `<button class="btn btn-primary btn-sm" onclick="openInVSCode('${repo.id}')">Open</button>`
+              ? `<button class="btn btn-danger btn-sm" data-action="close-vscode">Close VS Code</button>`
+              : `<button class="btn btn-primary btn-sm" data-action="open-vscode">Open</button>`
             }
-            <button class="btn btn-secondary btn-sm" onclick="editCommands('${repo.id}')">Edit</button>
-            <button class="btn btn-secondary btn-sm" onclick="removeRepo('${repo.id}')"
-                    ${isRunning ? 'disabled' : ''}>Remove</button>
+            <button class="btn btn-secondary btn-sm" data-action="edit">Edit</button>
+            <button class="btn btn-secondary btn-sm" data-action="remove" ${isRunning ? 'disabled' : ''}>Remove</button>
           </div>
         </div>
       `;
@@ -143,7 +210,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function escapeAttr(s) {
-    return String(s).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+    return String(s).replace(/"/g, '&quot;');
   }
 
   async function addRepo() {
@@ -254,13 +321,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  }
-
-  // Make functions available globally
   function selectCommand(id, label) {
     selectedLabels[id] = label;
     renderRepos();
@@ -292,18 +352,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
-  window.addRepo = addRepo;
-  window.selectCommand = selectCommand;
-  window.runFromCard = runFromCard;
-  window.runCustomFromCard = runCustomFromCard;
-  window.editCommands = editCommands;
-  window.removeRepo = removeRepo;
-  window.openInVSCode = openInVSCode;
-  window.closeVSCode = closeVSCode;
-  window.runRepo = runRepo;
-  window.stopRepo = stopRepo;
+  const repoListEl = document.getElementById('repoList');
+  repoListEl.addEventListener('click', e => {
+    const target = e.target.closest('[data-action]');
+    if (!target) return;
+    const card = target.closest('.repo-card');
+    const id = card?.dataset.id;
+    if (!id) return;
+    switch (target.dataset.action) {
+      case 'stop':         return stopRepo(id);
+      case 'run':          return runFromCard(id);
+      case 'run-custom':   return runCustomFromCard(id);
+      case 'open-vscode':  return openInVSCode(id);
+      case 'close-vscode': return closeVSCode(id);
+      case 'edit':         return editCommands(id);
+      case 'remove':       return removeRepo(id);
+    }
+  });
+  repoListEl.addEventListener('change', e => {
+    const target = e.target.closest('[data-action="select-command"]');
+    if (!target) return;
+    const id = target.closest('.repo-card')?.dataset.id;
+    if (id) selectCommand(id, target.value);
+  });
 
-  // Set up event listeners
   document.getElementById('addRepo').addEventListener('click', addRepo);
   document.getElementById('searchInput').addEventListener('input', e => {
     searchQuery = e.target.value;
@@ -319,14 +391,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
-  // Initial load
-  await loadRepos();
+  loadRepos();
 
   setInterval(async () => {
     const prev = JSON.stringify(runningStatus);
     await updateRunningStatus();
     if (JSON.stringify(runningStatus) !== prev) renderRepos();
   }, 2000);
+}
 
-  console.log('App initialized successfully');
-});
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}

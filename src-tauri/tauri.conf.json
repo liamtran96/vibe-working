@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Repo Launcher",
+  "productName": "Vibe Working",
   "version": "1.0.0",
   "identifier": "com.repo-launcher.app",
   "build": {
@@ -10,17 +10,17 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Repo Launcher",
-        "width": 760,
+        "title": "Vibe Working",
+        "width": 1000,
         "height": 820,
-        "minWidth": 520,
+        "minWidth": 720,
         "minHeight": 600,
         "resizable": true,
         "center": true
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-src 'none'"
     }
   },
   "bundle": {
