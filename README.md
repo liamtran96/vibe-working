@@ -1,4 +1,4 @@
-# Repo Launcher
+# Vibe Working
 
 A small Tauri 2 desktop app for Windows that lets you manage and run multiple local repositories from a single window. Add a folder, attach one or more shell commands to it (e.g. `npm run dev`, `cargo run`, `pnpm test`), and start, stop, or open them in VS Code with a click.
 
@@ -74,7 +74,7 @@ Exposes 11 `#[tauri::command]` functions:
 
 **Shared state** — `AppState { running_processes: Mutex<HashMap<String, RunningProcess>> }` tracks live `Child` handles plus the label that started them.
 
-**Config persistence** — repos are written to `{config_dir}/config.json`, where `config_dir` is resolved via the `directories` crate using `("com", "repo-launcher", "RepoLauncher")`. The file is reloaded on every command and rewritten after every mutation.
+**Config persistence** — repos are written to `{config_dir}/config.json`, where `config_dir` is resolved via the `directories` crate using `("com", "vibe-working", "VibeWorking")`. The file is reloaded on every command and rewritten after every mutation.
 
 **Shutdown hook** — the `on_window_event` handler kills every tracked child on `WindowEvent::Destroyed`, so closing the window won't leave orphaned dev servers.
 
@@ -101,13 +101,13 @@ Legacy migration: if a repo loaded from disk has an empty `commands` list but a 
 
 - Window: 760×820, min 520×600, resizable, centered.
 - Plugins: `tauri-plugin-dialog` (native folder picker).
-- Bundle identifier: `com.repo-launcher.app`.
+- Bundle identifier: `com.vibe-working.app`.
 - Release profile: `strip = true`, `lto = true`, `codegen-units = 1` for a small binary.
 
 ## Project layout
 
 ```
-repo-launcher/
+vibe-working/
 ├── src/                  # Frontend (vanilla JS, HTML, CSS)
 │   ├── index.html
 │   ├── main.js

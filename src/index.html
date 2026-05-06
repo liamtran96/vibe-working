@@ -34,7 +34,26 @@
           </span>
           <span>Notes</span>
         </button>
+        <button class="nav-item" data-view="chat">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M2.5 4.5A1.5 1.5 0 0 1 4 3h8a1.5 1.5 0 0 1 1.5 1.5v5A1.5 1.5 0 0 1 12 11H6.5L4 13.5V11h-.5A1.5 1.5 0 0 1 2 9.5v-5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span>Chat</span>
+        </button>
       </nav>
+      <div class="sidebar-foot">
+        <button id="sidebarSettingsBtn" class="nav-item" title="Settings" aria-label="Settings">
+          <span class="nav-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </span>
+          <span>Settings</span>
+        </button>
+      </div>
     </aside>
 
     <main class="view-host">
@@ -94,7 +113,17 @@
               <input type="text" id="noteSearchInput" placeholder="Search" autocomplete="off" />
             </div>
           </div>
+
+          <div class="folder-tree-wrap">
+            <div class="folder-tree-head">
+              <span>Folders</span>
+              <button id="newFolderBtn" class="ghost-btn" title="New folder">+</button>
+            </div>
+            <div id="folderTree" class="folder-tree" role="tree"></div>
+          </div>
+
           <div id="noteTagFilters" class="tag-filter-row"></div>
+
           <div id="noteList" class="note-list" tabindex="0"></div>
           <div id="noteEmptyState" class="notes-list-empty hidden">
             <p>No notes</p>
@@ -108,6 +137,7 @@
             </span>
             <span id="notesFolderPath" class="folder-path">…</span>
           </button>
+
         </div>
 
         <div id="notesEditorCol" class="notes-editor-col">
@@ -137,7 +167,7 @@
           <div id="editorPane" class="editor-pane hidden">
             <header class="editor-head">
               <input type="text" id="noteTitle" class="note-title-input" placeholder="Untitled" />
-              <input type="text" id="noteTags" class="note-tags-input" placeholder="Tags…" />
+              <div id="noteTagsPicker" class="note-tags-picker"></div>
               <div class="editor-actions-inline">
                   <button id="pinBtn" class="icon-btn" title="Pin note" aria-pressed="false">
                     <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -166,6 +196,14 @@
               <textarea id="noteBody" class="note-body" placeholder="Start writing… (type / for blocks, [[ to link)" spellcheck="false"></textarea>
               <div id="notePreview" class="note-preview"></div>
             </div>
+            <!-- Claude-Code-style loader bar: visible while an AI command runs -->
+            <div id="aiLoader" class="ai-loader hidden" aria-live="polite">
+              <span id="aiLoaderSpinner" class="ai-loader-spinner">⠋</span>
+              <span id="aiLoaderLabel" class="ai-loader-label">Thinking</span>
+              <span class="ai-loader-sep">·</span>
+              <span id="aiLoaderTime" class="ai-loader-time">0s</span>
+              <span id="aiLoaderTokens" class="ai-loader-tokens"></span>
+            </div>
             <div id="backlinksPane" class="backlinks-pane hidden" aria-label="Linked references">
               <div class="backlinks-head">
                 <span class="backlinks-title">Linked references</span>
@@ -181,6 +219,74 @@
           </div>
         </div>
       </section>
+
+      <!-- ===================== CHAT VIEW ===================== -->
+      <section id="view-chat" class="view chat-view hidden">
+        <div class="chat-list-col">
+          <div class="chat-list-header">
+            <button id="newChatBtn" class="btn btn-primary btn-sm">+ New chat</button>
+          </div>
+          <div id="chatList" class="chat-list" tabindex="0"></div>
+          <div id="chatListEmpty" class="notes-list-empty hidden">
+            <p>No conversations</p>
+            <p class="hint">Start a new chat to begin.</p>
+          </div>
+          <div class="chat-health-footer">
+            <span id="chatHealthDot" class="health-dot health-unknown" aria-hidden="true"></span>
+            <span id="chatHealthLabel">Checking…</span>
+          </div>
+        </div>
+
+        <div class="chat-thread-col">
+          <div id="chatEmpty" class="editor-empty">
+            <div>
+              <p>Select or start a chat</p>
+              <p class="hint">Talks to your local llama.cpp server.</p>
+            </div>
+          </div>
+          <div id="chatPane" class="chat-pane hidden">
+            <header class="chat-head">
+              <input type="text" id="chatTitle" class="note-title-input" placeholder="Untitled chat" />
+              <button id="chatDeleteBtn" class="icon-btn" title="Delete chat">
+                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 6h18"/>
+                  <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                  <path d="M10 11v6"/>
+                  <path d="M14 11v6"/>
+                </svg>
+              </button>
+            </header>
+            <div id="chatMessages" class="chat-messages"></div>
+            <form id="chatComposer" class="chat-composer">
+              <textarea id="chatInput" class="chat-input" placeholder="Message Gemma… (Enter to send, Shift+Enter for newline)" rows="1" spellcheck="false"></textarea>
+              <button type="submit" id="chatSendBtn" class="btn btn-primary">Send</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- Tag operation prompt — generic single-input dialog -->
+      <div id="tagPromptOverlay" class="modal-overlay hidden" aria-hidden="true">
+        <div class="modal-backdrop"></div>
+        <div class="modal-box" role="dialog" aria-label="Tag prompt">
+          <header class="modal-head">
+            <h2 id="tagPromptTitle">…</h2>
+          </header>
+          <div class="modal-body">
+            <p id="tagPromptMessage" class="modal-message"></p>
+            <div id="tagPromptInputWrap" class="modal-input-wrap">
+              <input type="text" id="tagPromptInput" autocomplete="off" />
+              <datalist id="tagPromptDatalist"></datalist>
+            </div>
+            <p id="tagPromptAffected" class="modal-affected"></p>
+          </div>
+          <footer class="modal-foot">
+            <button id="tagPromptCancel" class="btn btn-secondary btn-sm">Cancel</button>
+            <button id="tagPromptOk" class="btn btn-primary btn-sm">OK</button>
+          </footer>
+        </div>
+      </div>
     </main>
   </div>
 
@@ -201,6 +307,70 @@
 
   <!-- Hidden mirror for textarea caret position -->
   <div id="caretMirror" class="caret-mirror" aria-hidden="true"></div>
+
+  <!-- Global Settings panel (Tags + Chat & AI) -->
+  <div id="sidebarSettings" class="settings-modal hidden" role="dialog" aria-label="Settings">
+    <div class="settings-modal-backdrop"></div>
+    <div class="settings-modal-box">
+      <div class="sidebar-settings-head">
+        <h3>Settings</h3>
+        <button id="sidebarSettingsClose" class="icon-btn icon-btn-sm" aria-label="Close">×</button>
+      </div>
+      <div class="sidebar-settings-tabs" role="tablist">
+        <button type="button" class="settings-tab active" role="tab" data-settings-tab="tags" aria-selected="true">
+          Tags <span class="settings-count" id="tagSectionCount">0</span>
+        </button>
+        <button type="button" class="settings-tab" role="tab" data-settings-tab="llm" aria-selected="false">
+          Chat &amp; AI
+        </button>
+        <button type="button" class="settings-tab" role="tab" data-settings-tab="updates" aria-selected="false">
+          Updates
+        </button>
+      </div>
+      <div class="sidebar-settings-body">
+        <div class="settings-panel" data-settings-panel="tags">
+          <div class="tag-manager">
+            <div class="tag-manager-toolbar">
+              <input type="text" id="tagManagerSearch" class="tag-manager-search" placeholder="Search tags…" autocomplete="off" />
+              <button type="button" id="tagManagerNewBtn" class="btn btn-primary btn-sm">+ New tag</button>
+            </div>
+            <div id="tagManagerBulk" class="tag-manager-bulk hidden">
+              <span id="tagManagerBulkCount">0 selected</span>
+              <button type="button" data-bulk-action="rename">Rename…</button>
+              <button type="button" data-bulk-action="merge">Merge into…</button>
+              <button type="button" class="danger" data-bulk-action="delete">Delete</button>
+            </div>
+            <div id="tagManagerList" class="tag-manager-list" role="list"></div>
+            <p id="tagManagerEmpty" class="tag-manager-empty hidden">
+              No tags yet. Add tags by typing comma-separated values in a note's tag field.
+            </p>
+            <p class="tag-manager-hint">
+              Deleting a tag removes it from notes — it never deletes the notes themselves.
+            </p>
+          </div>
+        </div>
+        <div class="settings-panel hidden" data-settings-panel="llm">
+          <div id="llmSettingsMount" class="llm-settings"></div>
+        </div>
+        <div class="settings-panel hidden" data-settings-panel="updates">
+          <div class="updates-pane">
+            <p class="updates-version">Current version: <span id="appVersion">…</span></p>
+            <button id="checkUpdatesBtn" class="btn btn-primary">Check for updates</button>
+            <p id="updateStatus" class="updates-status"></p>
+            <div id="updateProgress" class="updates-progress hidden">
+              <progress id="updateProgressBar" value="0" max="100"></progress>
+              <span id="updateProgressLabel" class="updates-progress-label">0%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="sidebar-settings-foot hidden" data-settings-foot="llm">
+        <span class="settings-save-status" id="sidebarSettingsStatus"></span>
+        <button type="button" id="sidebarSettingsSave" class="btn btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
 
   <script src="vendor/marked.min.js"></script>
   <script src="vendor/purify.min.js"></script>

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-**Repo Launcher** is a Tauri 2 desktop app for Windows that lets developers manage and run multiple repositories from a single UI. Users can add repos, assign shell commands (e.g. `npm run main`), start/stop processes, and open repos in VS Code.
+**Vibe Working** is a Tauri 2 desktop app for Windows that lets developers manage and run multiple repositories from a single UI. Users can add repos, assign shell commands (e.g. `npm run main`), start/stop processes, and open repos in VS Code.
 
 ## Commands
 
@@ -43,7 +43,7 @@ Exposes 11 `#[tauri::command]` functions. Key ones:
 
 **Shared state** (`AppState`) uses `Mutex<HashMap<String, Child>>` to track live processes across commands.
 
-**Config persistence** — repos are stored as JSON at `{config_dir}/config.json`, resolved via the `directories` crate (`com.repo-launcher.RepoLauncher`). Loaded on startup, written after every mutation.
+**Config persistence** — repos are stored as JSON at `{config_dir}/config.json`, resolved via the `directories` crate (`com.vibe-working.VibeWorking`). Loaded on startup, written after every mutation.
 
 ### Data Model
 
@@ -60,4 +60,4 @@ struct Repo {
 
 - Window: 500×600 px, resizable, centered
 - Permissions: `core:default`, `dialog:default`, `dialog:allow-open`
-- Bundle identifier: `com.repo-launcher.app`
+- Bundle identifier: `com.vibe-working.app`

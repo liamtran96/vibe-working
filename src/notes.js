@@ -1,13 +1,19 @@
 // Modern Notes view: three-column layout, auto-save, live preview,
 // command palette, slash menu, keyboard navigation.
 
-const { invoke } = window.__TAURI__.core;
+import { loadLlmConfig, mountLlmSettingsForm } from './llm-settings.js';
+import { appAlert, appConfirm, appPrompt, appChoice } from './dialogs.js';
+
+const { invoke, Channel } = window.__TAURI__.core;
 
 // ============================================================
 // State
 // ============================================================
 
 let notes = [];
+let folders = [];                       // string[] from list_folders
+let availableTags = [];                 // string[] from list_all_tags
+let editingTags = [];                   // mutable copy of selected note's tags
 let selectedId = null;
 let dirty = false;
 let saveTimer = null;
@@ -15,10 +21,35 @@ let previewTimer = null;
 let lastSavedAt = 0;
 let searchQuery = '';
 let activeTag = null;
+let activeFolder = null;                // null = "All"; "" = root only; "Work/Q2" = subtree
+let folderCollapsed = new Map();        // path -> bool
+let tagSelection = new Set();           // bulk-select in tag manager
+let tagSearchQuery = '';
 let showPreview = (localStorage.getItem('notesShowPreview') ?? '1') === '1';
 let listCollapsed = localStorage.getItem('notesListCollapsed') === '1';
 let inited = false;
 let savedRelativeTimer = null;
+let llmFormMounted = false;
+
+const FOLDER_COLLAPSE_KEY = 'notesFolderCollapsed';
+const ACTIVE_FOLDER_KEY = 'notesActiveFolder';
+
+try {
+  const raw = localStorage.getItem(FOLDER_COLLAPSE_KEY);
+  if (raw) folderCollapsed = new Map(JSON.parse(raw));
+} catch {}
+try {
+  const raw = localStorage.getItem(ACTIVE_FOLDER_KEY);
+  if (raw === 'null' || raw == null) activeFolder = null;
+  else activeFolder = raw;
+} catch {}
+
+function persistFolderCollapsed() {
+  localStorage.setItem(FOLDER_COLLAPSE_KEY, JSON.stringify([...folderCollapsed.entries()]));
+}
+function persistActiveFolder() {
+  localStorage.setItem(ACTIVE_FOLDER_KEY, activeFolder == null ? 'null' : activeFolder);
+}
 
 const SAVE_DEBOUNCE_MS = 600;
 const PREVIEW_DEBOUNCE_MS = 100;
@@ -32,7 +63,24 @@ const SLASH_ITEMS = [
   { key: 'quote',  title: 'Quote',         desc: 'Blockquote',              snippet: '> ' },
   { key: 'code',   title: 'Code block',    desc: 'Fenced code block',       snippet: '```\n\n```\n', cursorOffset: -5 },
   { key: 'hr',     title: 'Divider',       desc: 'Horizontal rule',         snippet: '---\n' },
+  { key: 'ai-summarize', title: 'AI: Summarize note',     desc: 'Insert a summary of the whole note', aiMode: 'summarize' },
+  { key: 'ai-rewrite',   title: 'AI: Rewrite paragraph',  desc: 'Rewrite the paragraph above',        aiMode: 'rewrite' },
+  { key: 'ai-expand',    title: 'AI: Expand paragraph',   desc: 'Expand the paragraph above',         aiMode: 'expand' },
 ];
+
+const AI_SYSTEM_PROMPTS = {
+  summarize:
+    'You summarize notes. Write a concise 3-5 sentence summary in plain prose. ' +
+    'Do not preface with "Here is" or quote the input. Output only the summary text.',
+  rewrite:
+    'You rewrite text to be clearer, tighter, and more readable while preserving meaning and tone. ' +
+    'Output only the rewritten text — no preamble, no quotes, no commentary.',
+  expand:
+    'You expand a brief outline or note into a fuller paragraph that develops the ideas naturally. ' +
+    'Output only the expanded prose — no preamble, no headings, no commentary.',
+};
+
+let aiRunning = false;
 
 let slashOpen = false;
 let slashStartPos = -1;       // position of the `/` in textarea
@@ -111,10 +159,20 @@ export function openCommandPalette() {
 
 async function loadNotes() {
   try {
-    notes = await invoke('get_notes');
+    const [n, f, t] = await Promise.all([
+      invoke('get_notes'),
+      invoke('list_folders'),
+      invoke('list_all_tags'),
+    ]);
+    notes = n;
+    folders = f || [];
+    availableTags = t || [];
     rebuildLinkIndex();
     invalidateTitleIndex();
+    renderFolderTree();
     renderList();
+    renderTagPicker();
+    if (isSettingsOpen()) renderTagManager();
   } catch (e) {
     console.error('loadNotes error:', e);
   }
@@ -164,7 +222,12 @@ function renderList() {
       (n.title || '').toLowerCase().includes(q) ||
       (n.body || '').toLowerCase().includes(q);
     const matchesTag = !activeTag || (n.tags || []).includes(activeTag);
-    return matchesSearch && matchesTag;
+    const f = n.folder || '';
+    const matchesFolder =
+      activeFolder == null ? true :
+      activeFolder === ''   ? f === '' :
+      f === activeFolder || f.startsWith(activeFolder + '/');
+    return matchesSearch && matchesTag && matchesFolder;
   });
 
   if (filtered.length === 0) {
@@ -194,6 +257,10 @@ function renderList() {
 
   listEl.querySelectorAll('.note-row').forEach(row => {
     row.addEventListener('click', () => selectNote(row.dataset.id));
+    row.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/x-note-id', row.dataset.id);
+      e.dataTransfer.effectAllowed = 'move';
+    });
   });
 }
 
@@ -203,15 +270,18 @@ function noteRowHTML(n) {
   const tagsHtml = (n.tags || []).slice(0, 2).map(t =>
     `<span class="note-row-tag">${escapeHtml(t)}</span>`
   ).join('');
+  const folderHint = n.folder
+    ? `<span class="note-row-folder" title="${escapeAttr(n.folder)}">${escapeHtml(n.folder)}</span>`
+    : '';
   return `
-    <div class="note-row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(n.id)}">
+    <div class="note-row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(n.id)}" draggable="true">
       <div class="note-row-head">
         <div class="note-row-title">${escapeHtml(n.title || 'Untitled')}</div>
         ${n.pinned ? '<span class="note-row-pin" title="Pinned">📌</span>' : ''}
       </div>
       ${snippet ? `<div class="note-row-snippet">${escapeHtml(snippet)}</div>` : ''}
       <div class="note-row-meta">
-        <div class="note-row-tags">${tagsHtml}</div>
+        <div class="note-row-tags">${tagsHtml}${folderHint}</div>
         <span title="Created ${escapeAttr(formatFullDate(n.created_at))}\nUpdated ${escapeAttr(formatFullDate(n.updated_at))}">${formatRelativeDate(n.updated_at)}</span>
       </div>
     </div>
@@ -245,6 +315,711 @@ function renderTagFilters() {
 }
 
 // ============================================================
+// Tag picker (in editor head) — chips + popover for adding from registry
+// ============================================================
+
+function renderTagPicker() {
+  const host = document.getElementById('noteTagsPicker');
+  if (!host) return;
+  if (!selectedId) {
+    host.innerHTML = '';
+    return;
+  }
+  const chips = editingTags.map(t => `
+    <span class="tag-pick-chip" data-tag="${escapeAttr(t)}">
+      <span>${escapeHtml(t)}</span>
+      <button type="button" class="tag-pick-remove" data-action="remove" aria-label="Remove ${escapeAttr(t)}">×</button>
+    </span>
+  `).join('');
+  host.innerHTML = `
+    ${chips}
+    <button type="button" id="tagPickerAdd" class="tag-pick-add" title="Add tag">+ Tag</button>
+  `;
+  host.querySelectorAll('.tag-pick-remove').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const chip = btn.closest('.tag-pick-chip');
+      const tag = chip?.dataset.tag;
+      if (!tag) return;
+      editingTags = editingTags.filter(t => t !== tag);
+      renderTagPicker();
+      onMetaInput();
+    });
+  });
+  host.querySelector('#tagPickerAdd')?.addEventListener('click', e => {
+    e.stopPropagation();
+    openTagPickerPopover(host.querySelector('#tagPickerAdd'));
+  });
+}
+
+function openTagPickerPopover(anchor) {
+  document.querySelectorAll('.tag-pick-popover').forEach(p => p.remove());
+  const popover = document.createElement('div');
+  popover.className = 'tag-pick-popover';
+  document.body.appendChild(popover);
+
+  let query = '';
+  function render() {
+    const remaining = availableTags.filter(t => !editingTags.includes(t));
+    const filtered = query
+      ? remaining.filter(t => t.toLowerCase().includes(query.toLowerCase()))
+      : remaining;
+    const items = filtered.length
+      ? filtered.map(t => `<button type="button" class="tag-pick-item" data-tag="${escapeAttr(t)}">${escapeHtml(t)}</button>`).join('')
+      : `<p class="tag-pick-empty">${availableTags.length === 0
+          ? 'No tags configured yet. Open Settings → Tags to create one.'
+          : (remaining.length === 0
+            ? 'All tags are already on this note.'
+            : 'No tags match your search.')}</p>`;
+    popover.innerHTML = `
+      <input type="text" class="tag-pick-search" placeholder="Search tags…" autocomplete="off" />
+      <div class="tag-pick-list">${items}</div>
+    `;
+    const input = popover.querySelector('.tag-pick-search');
+    input.value = query;
+    input.addEventListener('input', e => { query = e.target.value; render(); });
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Escape') { close(); }
+      else if (e.key === 'Enter') {
+        const first = popover.querySelector('.tag-pick-item');
+        first?.click();
+      }
+    });
+    popover.querySelectorAll('.tag-pick-item').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tag = btn.dataset.tag;
+        if (tag && !editingTags.includes(tag)) editingTags.push(tag);
+        close();
+        renderTagPicker();
+        onMetaInput();
+      });
+    });
+    setTimeout(() => input.focus(), 0);
+  }
+  render();
+
+  const rect = anchor.getBoundingClientRect();
+  popover.style.left = `${Math.max(8, rect.left)}px`;
+  popover.style.top = `${rect.bottom + 4}px`;
+
+  function close() {
+    popover.remove();
+    document.removeEventListener('mousedown', onOutside);
+  }
+  function onOutside(e) {
+    if (!popover.contains(e.target) && e.target !== anchor) close();
+  }
+  setTimeout(() => document.addEventListener('mousedown', onOutside), 0);
+}
+
+// ============================================================
+// Folder tree
+// ============================================================
+
+function buildFolderTree() {
+  // Build a tree from flat folder paths.
+  const root = { name: '', path: '', children: new Map(), depth: 0 };
+  for (const path of folders) {
+    const segs = path.split('/').filter(Boolean);
+    let cur = root;
+    let acc = '';
+    segs.forEach((seg, i) => {
+      acc = acc ? `${acc}/${seg}` : seg;
+      if (!cur.children.has(seg)) {
+        cur.children.set(seg, { name: seg, path: acc, children: new Map(), depth: i + 1 });
+      }
+      cur = cur.children.get(seg);
+    });
+  }
+  return root;
+}
+
+function noteCountInFolder(path) {
+  // Counts notes in `path` and all descendants.
+  if (path === '') return notes.filter(n => !n.folder).length;
+  return notes.filter(n => {
+    const f = n.folder || '';
+    return f === path || f.startsWith(path + '/');
+  }).length;
+}
+
+function renderFolderTree() {
+  const container = document.getElementById('folderTree');
+  if (!container) return;
+  const tree = buildFolderTree();
+
+  const rows = [];
+  const ICON_FOLDER = `<svg class="folder-row-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.379a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.12 5H12.5A1.5 1.5 0 0 1 14 6.5v5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5v-7Z" stroke="currentColor" stroke-width="1.3"/></svg>`;
+  const ICON_INBOX = `<svg class="folder-row-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 9h3l1 2h4l1-2h3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 4h10l1 5v3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V9l1-5Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>`;
+  const ICON_ALL = `<svg class="folder-row-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M3 3.5h7l3 3v6.5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.3"/><path d="M5 8h6M5 11h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>`;
+  const CHEVRON = `<svg class="folder-row-chevron" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+  // "All notes" — top-level filter, no tree decoration
+  rows.push(`
+    <div class="folder-row folder-row-special ${activeFolder == null ? 'active' : ''}"
+         data-folder="" data-action="select-all">
+      <span class="folder-row-guides"></span>
+      <span class="folder-row-chev-slot"></span>
+      ${ICON_ALL}
+      <span class="folder-row-name">All notes</span>
+      <span class="folder-row-count">${notes.length}</span>
+      <span></span>
+    </div>
+  `);
+  // "(root)" — notes with empty folder
+  rows.push(`
+    <div class="folder-row folder-row-special ${activeFolder === '' ? 'active' : ''}"
+         data-folder="" data-action="select-root">
+      <span class="folder-row-guides"></span>
+      <span class="folder-row-chev-slot"></span>
+      ${ICON_INBOX}
+      <span class="folder-row-name">No folder</span>
+      <span class="folder-row-count">${noteCountInFolder('')}</span>
+      <span></span>
+    </div>
+  `);
+
+  function walk(node, ancestorIsLast) {
+    if (node.children.size === 0) return;
+    const sorted = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+    sorted.forEach((child, idx) => {
+      const isLast = idx === sorted.length - 1;
+      const collapsed = !!folderCollapsed.get(child.path);
+      const hasKids = child.children.size > 0;
+      // Indent guides: one thin vertical line per ancestor whose subtree is
+      // still continuing (i.e. that ancestor was NOT a last child).
+      const guides = ancestorIsLast
+        .map(last => `<span class="folder-guide ${last ? 'is-blank' : ''}"></span>`)
+        .join('');
+      const chev = hasKids
+        ? `<span class="folder-row-chev-slot ${collapsed ? '' : 'expanded'}" data-action="toggle-collapse">${CHEVRON}</span>`
+        : `<span class="folder-row-chev-slot"></span>`;
+      rows.push(`
+        <div class="folder-row ${activeFolder === child.path ? 'active' : ''}"
+             data-folder="${escapeAttr(child.path)}"
+             draggable="false">
+          <span class="folder-row-guides">${guides}</span>
+          ${chev}
+          ${ICON_FOLDER}
+          <span class="folder-row-name" title="${escapeAttr(child.path)}">${escapeHtml(child.name)}</span>
+          <span class="folder-row-count">${noteCountInFolder(child.path)}</span>
+          <button type="button" class="folder-row-menu" data-action="folder-menu" aria-label="Folder actions">⋯</button>
+        </div>
+      `);
+      if (!collapsed) walk(child, [...ancestorIsLast, isLast]);
+    });
+  }
+  walk(tree, []);
+
+  container.innerHTML = rows.join('');
+  wireFolderTreeEvents(container);
+}
+
+function wireFolderTreeEvents(container) {
+  container.querySelectorAll('.folder-row').forEach(row => {
+    const path = row.dataset.folder;
+    const selectAll = row.dataset.action === 'select-all';
+    const selectRoot = row.dataset.action === 'select-root';
+
+    row.addEventListener('click', e => {
+      const actionEl = e.target.closest?.('[data-action]');
+      const action = actionEl?.dataset?.action;
+      if (action === 'toggle-collapse') {
+        e.stopPropagation();
+        if (path) {
+          folderCollapsed.set(path, !folderCollapsed.get(path));
+          persistFolderCollapsed();
+          renderFolderTree();
+        }
+        return;
+      }
+      if (action === 'folder-menu') {
+        e.stopPropagation();
+        openFolderContextMenu(path, actionEl);
+        return;
+      }
+      activeFolder = selectAll ? null : (selectRoot ? '' : path);
+      persistActiveFolder();
+      renderFolderTree();
+      renderList();
+    });
+
+    // Drop target — only real folders (skip "All notes" pseudo-row)
+    if (selectAll) return;
+    row.addEventListener('dragover', e => {
+      if (!e.dataTransfer.types.includes('text/x-note-id')) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      row.classList.add('drag-over');
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', async e => {
+      row.classList.remove('drag-over');
+      const noteId = e.dataTransfer.getData('text/x-note-id');
+      if (!noteId) return;
+      e.preventDefault();
+      await moveNoteToFolder(noteId, selectRoot ? '' : path);
+    });
+  });
+}
+
+async function moveNoteToFolder(noteId, targetFolder) {
+  const note = notes.find(n => n.id === noteId);
+  if (!note) return;
+  if ((note.folder || '') === targetFolder) return;
+  await flushSaveIfDirty();
+  try {
+    const updated = await invoke('update_note', {
+      id: note.id,
+      title: note.title,
+      body: note.body,
+      tags: note.tags || [],
+      pinned: !!note.pinned,
+      folder: targetFolder,
+    });
+    const idx = notes.findIndex(n => n.id === noteId);
+    if (idx >= 0) notes[idx] = updated;
+    sortNotes();
+    renderFolderTree();
+    renderList();
+  } catch (e) {
+    appAlert('Could not move note: ' + e, { title: 'Error' });
+  }
+}
+
+async function createFolderUi(parent = '') {
+  const name = await appPrompt(
+    parent ? `New subfolder under "${parent}":` : 'New folder name:',
+    { title: parent ? 'New subfolder' : 'New folder', okLabel: 'Create' }
+  );
+  if (!name) return;
+  const path = parent ? `${parent}/${name}` : name;
+  try {
+    await invoke('create_folder', { path });
+    await loadNotes();
+  } catch (e) {
+    appAlert('Could not create folder: ' + e, { title: 'Error' });
+  }
+}
+
+async function renameFolderUi(path) {
+  const next = await appPrompt(`Rename "${path}" to:`, {
+    title: 'Rename folder',
+    defaultValue: path.split('/').pop(),
+    okLabel: 'Rename',
+  });
+  if (!next) return;
+  const segs = path.split('/');
+  segs[segs.length - 1] = next;
+  const newPath = segs.join('/');
+  try {
+    await invoke('rename_folder', { old: path, new: newPath });
+    if (activeFolder === path) {
+      activeFolder = newPath;
+      persistActiveFolder();
+    }
+    await loadNotes();
+  } catch (e) {
+    appAlert('Could not rename folder: ' + e, { title: 'Error' });
+  }
+}
+
+async function deleteFolderUi(path) {
+  const count = noteCountInFolder(path);
+  let mode;
+  if (count === 0) {
+    const ok = await appConfirm(`Delete empty folder "${path}"?`, {
+      title: 'Delete folder', okLabel: 'Delete', danger: true,
+    });
+    if (!ok) return;
+    mode = 'delete';
+  } else {
+    const choice = await appChoice(
+      `"${path}" contains ${count} note${count === 1 ? '' : 's'}. What should happen to them?`,
+      [
+        { label: 'Move notes to root', value: 'move-to-root', variant: 'btn-primary' },
+        { label: 'Delete notes too', value: 'delete', variant: 'btn-danger' },
+      ],
+      { title: 'Delete folder' }
+    );
+    if (!choice) return;
+    if (choice === 'delete') {
+      const ok = await appConfirm(
+        `Permanently delete ${count} note${count === 1 ? '' : 's'}? This cannot be undone.`,
+        { title: 'Confirm delete', okLabel: 'Delete', danger: true }
+      );
+      if (!ok) return;
+    }
+    mode = choice;
+  }
+  try {
+    await invoke('delete_folder', { path, mode });
+    if (activeFolder === path || (activeFolder || '').startsWith(path + '/')) {
+      activeFolder = null;
+      persistActiveFolder();
+    }
+    await loadNotes();
+  } catch (e) {
+    appAlert('Could not delete folder: ' + e, { title: 'Error' });
+  }
+}
+
+function openFolderContextMenu(path, anchor) {
+  // Tiny inline menu — replaces the existing one if any
+  document.querySelectorAll('.folder-context-menu').forEach(m => m.remove());
+  const menu = document.createElement('div');
+  menu.className = 'folder-context-menu';
+  menu.innerHTML = `
+    <button type="button" data-action="new-sub">+ New subfolder</button>
+    <button type="button" data-action="rename">Rename</button>
+    <button type="button" class="danger" data-action="delete">Delete</button>
+  `;
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = `${rect.left}px`;
+  menu.style.top = `${rect.bottom + 2}px`;
+  const close = () => menu.remove();
+  menu.addEventListener('click', e => {
+    const action = e.target?.dataset?.action;
+    if (!action) return;
+    close();
+    if (action === 'new-sub') createFolderUi(path);
+    else if (action === 'rename') renameFolderUi(path);
+    else if (action === 'delete') deleteFolderUi(path);
+  });
+  setTimeout(() => {
+    document.addEventListener('mousedown', function once(e) {
+      if (!menu.contains(e.target)) {
+        close();
+        document.removeEventListener('mousedown', once);
+      }
+    });
+  }, 0);
+}
+
+// ============================================================
+// Sidebar settings panel + tag manager
+// ============================================================
+
+function isSettingsOpen() {
+  const panel = document.getElementById('sidebarSettings');
+  return panel && !panel.classList.contains('hidden');
+}
+
+export async function openSidebarSettings() {
+  const panel = document.getElementById('sidebarSettings');
+  if (!panel) return;
+  panel.classList.remove('hidden');
+  if (!llmFormMounted) {
+    await loadLlmConfig();
+    const mount = document.getElementById('llmSettingsMount');
+    if (mount) {
+      mountLlmSettingsForm(mount, {
+        saveButton: document.getElementById('sidebarSettingsSave'),
+        statusEl: document.getElementById('sidebarSettingsStatus'),
+      });
+      llmFormMounted = true;
+    }
+    wireSettingsTabs();
+  }
+  renderTagManager();
+}
+
+function wireSettingsTabs() {
+  const tabs = document.querySelectorAll('.settings-tab');
+  const panels = document.querySelectorAll('.settings-panel');
+  const foot = document.querySelector('.sidebar-settings-foot');
+  const activate = (key) => {
+    tabs.forEach(t => {
+      const active = t.dataset.settingsTab === key;
+      t.classList.toggle('active', active);
+      t.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    panels.forEach(p => {
+      p.classList.toggle('hidden', p.dataset.settingsPanel !== key);
+    });
+    if (foot) {
+      foot.classList.toggle('hidden', foot.dataset.settingsFoot !== key);
+    }
+  };
+  tabs.forEach(t => t.addEventListener('click', () => activate(t.dataset.settingsTab)));
+}
+
+function closeSidebarSettings() {
+  const panel = document.getElementById('sidebarSettings');
+  if (panel) panel.classList.add('hidden');
+}
+
+function tagCounts() {
+  const map = new Map();
+  // Seed with all configured tags so zero-count tags still appear in the manager.
+  for (const t of availableTags) map.set(t, 0);
+  for (const n of notes) {
+    for (const t of n.tags || []) {
+      map.set(t, (map.get(t) || 0) + 1);
+    }
+  }
+  return [...map.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+async function createTagUi() {
+  const name = await appPrompt('Name for the new tag:', {
+    title: 'New tag',
+    placeholder: 'e.g. work, todo, idea',
+    okLabel: 'Create',
+    validate: v => {
+      if (!v) return 'Tag name is required.';
+      if (availableTags.some(t => t.toLowerCase() === v.toLowerCase())) {
+        return 'A tag with that name already exists.';
+      }
+      return null;
+    },
+  });
+  if (!name) return;
+  try {
+    await invoke('create_tag', { name });
+    await loadNotes();
+  } catch (e) {
+    appAlert('Could not create tag: ' + e, { title: 'Error' });
+  }
+}
+
+function renderTagManager() {
+  const listEl = document.getElementById('tagManagerList');
+  const emptyEl = document.getElementById('tagManagerEmpty');
+  const countEl = document.getElementById('tagSectionCount');
+  const bulkEl = document.getElementById('tagManagerBulk');
+  const bulkCountEl = document.getElementById('tagManagerBulkCount');
+  if (!listEl) return;
+
+  const all = tagCounts();
+  // Drop selections that no longer exist.
+  for (const t of [...tagSelection]) {
+    if (!all.some(x => x.name === t)) tagSelection.delete(t);
+  }
+
+  countEl.textContent = String(all.length);
+
+  const q = tagSearchQuery.trim().toLowerCase();
+  const visible = q ? all.filter(t => t.name.toLowerCase().includes(q)) : all;
+
+  if (all.length === 0) {
+    listEl.innerHTML = '';
+    emptyEl.classList.remove('hidden');
+  } else {
+    emptyEl.classList.add('hidden');
+    listEl.innerHTML = visible.map(t => `
+      <div class="tag-manager-row ${tagSelection.has(t.name) ? 'selected' : ''}" data-tag="${escapeAttr(t.name)}">
+        <input type="checkbox" data-act="select" ${tagSelection.has(t.name) ? 'checked' : ''} aria-label="Select ${escapeAttr(t.name)}">
+        <span class="tag-manager-name">${escapeHtml(t.name)}</span>
+        <span class="tag-manager-count">${t.count}</span>
+        <button type="button" data-act="rename" title="Rename">✎</button>
+        <button type="button" data-act="merge" title="Merge into…">⇄</button>
+        <button type="button" class="danger" data-act="delete" title="Delete">🗑</button>
+      </div>
+    `).join('') || `<p class="tag-manager-empty-search">No tags match “${escapeHtml(q)}”.</p>`;
+
+    listEl.querySelectorAll('.tag-manager-row').forEach(row => {
+      const tag = row.dataset.tag;
+      row.addEventListener('click', e => {
+        const act = e.target?.dataset?.act;
+        if (!act) return;
+        if (act === 'select') {
+          if (e.target.checked) tagSelection.add(tag);
+          else tagSelection.delete(tag);
+          renderTagManager();
+          return;
+        }
+        if (act === 'rename') tagRenameUi(tag);
+        else if (act === 'merge') tagMergeUi(tag);
+        else if (act === 'delete') tagDeleteUi(tag);
+      });
+    });
+  }
+
+  if (tagSelection.size > 0) {
+    bulkEl.classList.remove('hidden');
+    bulkCountEl.textContent = `${tagSelection.size} selected`;
+  } else {
+    bulkEl.classList.add('hidden');
+  }
+}
+
+// ----- Tag prompt overlay (single shared dialog) -----
+
+function showTagPrompt({ title, message, defaultValue = '', placeholder = '', datalist = null, affected = '', okLabel = 'OK', requireValue = true }) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('tagPromptOverlay');
+    document.getElementById('tagPromptTitle').textContent = title;
+    document.getElementById('tagPromptMessage').textContent = message || '';
+    const input = document.getElementById('tagPromptInput');
+    input.value = defaultValue;
+    input.placeholder = placeholder;
+    const wrap = document.getElementById('tagPromptInputWrap');
+    if (defaultValue === null) {
+      wrap.classList.add('hidden');
+    } else {
+      wrap.classList.remove('hidden');
+    }
+    const dl = document.getElementById('tagPromptDatalist');
+    if (datalist && datalist.length) {
+      dl.innerHTML = datalist.map(v => `<option value="${escapeAttr(v)}"></option>`).join('');
+      input.setAttribute('list', 'tagPromptDatalist');
+    } else {
+      dl.innerHTML = '';
+      input.removeAttribute('list');
+    }
+    const affEl = document.getElementById('tagPromptAffected');
+    affEl.textContent = affected || '';
+    const okBtn = document.getElementById('tagPromptOk');
+    okBtn.textContent = okLabel;
+    overlay.classList.remove('hidden');
+    setTimeout(() => input.focus(), 0);
+
+    function cleanup(result) {
+      overlay.classList.add('hidden');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      input.removeEventListener('keydown', onKey);
+      resolve(result);
+    }
+    function onOk() {
+      const val = (input.value || '').trim();
+      if (requireValue && !val && defaultValue !== null) return;
+      cleanup({ ok: true, value: val });
+    }
+    function onCancel() { cleanup({ ok: false }); }
+    function onKey(e) {
+      if (e.key === 'Enter') { e.preventDefault(); onOk(); }
+      else if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+    }
+    const cancelBtn = document.getElementById('tagPromptCancel');
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    input.addEventListener('keydown', onKey);
+  });
+}
+
+async function tagRenameUi(tag) {
+  const count = await invoke('count_notes_with_tag', { name: tag });
+  const result = await showTagPrompt({
+    title: 'Rename tag',
+    message: `“${tag}” →`,
+    defaultValue: tag,
+    placeholder: 'new name',
+    affected: `Affects ${count} note${count === 1 ? '' : 's'}.`,
+    okLabel: 'Rename',
+  });
+  if (!result.ok || !result.value || result.value === tag) return;
+  await flushSaveIfDirty();
+  try {
+    await invoke('rename_tag', { old: tag, new: result.value });
+    tagSelection.delete(tag);
+    if (activeTag === tag) activeTag = result.value;
+    await loadNotes();
+  } catch (e) { appAlert('Rename failed: ' + e, { title: 'Error' }); }
+}
+
+async function tagMergeUi(tag) {
+  const others = tagCounts().map(t => t.name).filter(n => n !== tag);
+  if (others.length === 0) {
+    appAlert('There are no other tags to merge into.', { title: 'Merge tags' });
+    return;
+  }
+  const count = await invoke('count_notes_with_tag', { name: tag });
+  const result = await showTagPrompt({
+    title: 'Merge tags',
+    message: `Merge “${tag}” into:`,
+    defaultValue: '',
+    placeholder: 'target tag name',
+    datalist: others,
+    affected: `Affects ${count} note${count === 1 ? '' : 's'}. Notes already tagged with the target are deduped automatically.`,
+    okLabel: 'Merge',
+  });
+  if (!result.ok || !result.value || result.value === tag) return;
+  await flushSaveIfDirty();
+  try {
+    await invoke('merge_tags', { from: tag, into: result.value });
+    tagSelection.delete(tag);
+    if (activeTag === tag) activeTag = result.value;
+    await loadNotes();
+  } catch (e) { appAlert('Merge failed: ' + e, { title: 'Error' }); }
+}
+
+async function tagDeleteUi(tag) {
+  const count = await invoke('count_notes_with_tag', { name: tag });
+  const result = await showTagPrompt({
+    title: 'Delete tag',
+    message: `Remove “${tag}” from ${count} note${count === 1 ? '' : 's'}?`,
+    defaultValue: null,
+    affected: 'Notes themselves stay intact — only the tag assignment is removed.',
+    okLabel: 'Delete',
+  });
+  if (!result.ok) return;
+  await flushSaveIfDirty();
+  try {
+    await invoke('delete_tag', { name: tag });
+    tagSelection.delete(tag);
+    if (activeTag === tag) activeTag = null;
+    await loadNotes();
+  } catch (e) { appAlert('Delete failed: ' + e, { title: 'Error' }); }
+}
+
+async function bulkTagAction(action) {
+  const tags = [...tagSelection];
+  if (tags.length === 0) return;
+  await flushSaveIfDirty();
+  try {
+    if (action === 'rename') {
+      const result = await showTagPrompt({
+        title: `Rename ${tags.length} tags`,
+        message: 'Replace selected tags with the same new name (will merge them).',
+        defaultValue: '',
+        placeholder: 'new name',
+        affected: `Selected: ${tags.join(', ')}`,
+        okLabel: 'Rename',
+      });
+      if (!result.ok || !result.value) return;
+      for (const t of tags) {
+        if (t === result.value) continue;
+        await invoke('rename_tag', { old: t, new: result.value });
+      }
+    } else if (action === 'merge') {
+      const others = tagCounts().map(t => t.name).filter(n => !tags.includes(n));
+      const result = await showTagPrompt({
+        title: `Merge ${tags.length} tags`,
+        message: 'Merge all selected tags into:',
+        defaultValue: '',
+        placeholder: 'target tag name',
+        datalist: others,
+        affected: `Selected: ${tags.join(', ')}`,
+        okLabel: 'Merge',
+      });
+      if (!result.ok || !result.value) return;
+      for (const t of tags) {
+        if (t === result.value) continue;
+        await invoke('merge_tags', { from: t, into: result.value });
+      }
+    } else if (action === 'delete') {
+      const ok = await appConfirm(
+        `Remove ${tags.length} tag${tags.length === 1 ? '' : 's'} from all notes?\n\n${tags.join(', ')}\n\nNotes themselves stay intact.`,
+        { title: 'Delete tags', okLabel: 'Delete', danger: true }
+      );
+      if (!ok) return;
+      for (const t of tags) {
+        await invoke('delete_tag', { name: t });
+      }
+    }
+    tagSelection.clear();
+    await loadNotes();
+  } catch (e) {
+    appAlert('Bulk action failed: ' + e, { title: 'Error' });
+  }
+}
+
+// ============================================================
 // Selection / editor population
 // ============================================================
 
@@ -265,7 +1040,8 @@ async function selectNote(id, opts = { focus: true }) {
 
 function populateEditor(note) {
   document.getElementById('noteTitle').value = note.title || '';
-  document.getElementById('noteTags').value = (note.tags || []).join(', ');
+  editingTags = [...(note.tags || [])];
+  renderTagPicker();
   document.getElementById('noteBody').value = note.body || '';
   const pinBtn = document.getElementById('pinBtn');
   pinBtn.setAttribute('aria-pressed', String(!!note.pinned));
@@ -300,7 +1076,8 @@ function showEditorEmpty() {
 async function newNote() {
   await flushSaveIfDirty();
   try {
-    const note = await invoke('create_note', { title: 'Untitled' });
+    const targetFolder = activeFolder == null ? '' : activeFolder;
+    const note = await invoke('create_note', { title: 'Untitled', folder: targetFolder });
     notes.unshift(note);
     sortNotes();
     indexNote(note);
@@ -312,13 +1089,16 @@ async function newNote() {
     setTimeout(() => document.getElementById('noteTitle').focus(), 0);
     document.getElementById('noteTitle').select?.();
   } catch (e) {
-    alert('Error creating note: ' + e);
+    appAlert('Error creating note: ' + e, { title: 'Error' });
   }
 }
 
 async function deleteCurrent() {
   if (!selectedId) return;
-  if (!confirm('Delete this note? This cannot be undone.')) return;
+  const ok = await appConfirm('Delete this note? This cannot be undone.', {
+    title: 'Delete note', okLabel: 'Delete', danger: true,
+  });
+  if (!ok) return;
   try {
     await invoke('delete_note', { id: selectedId });
     unindexNote(selectedId);
@@ -333,15 +1113,14 @@ async function deleteCurrent() {
     }
     renderList();
   } catch (e) {
-    alert('Error deleting note: ' + e);
+    appAlert('Error deleting note: ' + e, { title: 'Error' });
   }
 }
 
 function readEditor() {
   return {
     title: document.getElementById('noteTitle').value.trim() || 'Untitled',
-    tags: document.getElementById('noteTags').value
-      .split(',').map(t => t.trim()).filter(Boolean),
+    tags: [...editingTags],
     pinned: document.getElementById('pinBtn').getAttribute('aria-pressed') === 'true',
     body: document.getElementById('noteBody').value,
   };
@@ -351,9 +1130,11 @@ async function flushSave() {
   if (!selectedId || !dirty) return;
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   const data = readEditor();
+  const current = notes.find(n => n.id === selectedId);
+  const folder = current?.folder ?? '';
   setSaveStatus('saving');
   try {
-    const updated = await invoke('update_note', { id: selectedId, ...data });
+    const updated = await invoke('update_note', { id: selectedId, ...data, folder });
     const idx = notes.findIndex(n => n.id === selectedId);
     if (idx >= 0) notes[idx] = updated;
     reindexNote(updated);
@@ -596,7 +1377,7 @@ async function followWikiLink(target, knownId) {
     renderList();
     setTimeout(() => document.getElementById('noteBody').focus(), 0);
   } catch (e) {
-    alert('Error creating note: ' + e);
+    appAlert('Error creating note: ' + e, { title: 'Error' });
   }
 }
 
@@ -624,8 +1405,8 @@ function maybeOpenSlash() {
   slashFiltered = SLASH_ITEMS.slice();
   slashActiveIdx = 0;
   slashOpen = true;
-  positionSlashMenu();
   renderSlashMenu();
+  positionSlashMenu();
 }
 
 function closeSlash() {
@@ -671,6 +1452,15 @@ function applySlashSelection() {
   if (slashFiltered.length === 0) { closeSlash(); return; }
   const item = slashFiltered[slashActiveIdx];
   const ta = document.getElementById('noteBody');
+
+  if (item.aiMode) {
+    const slashStart = slashStartPos;
+    const slashEnd = ta.selectionStart;
+    closeSlash();
+    runAiCommand(item.aiMode, slashStart, slashEnd);
+    return;
+  }
+
   const before = ta.value.slice(0, slashStartPos);
   const after = ta.value.slice(ta.selectionStart);
   ta.value = before + item.snippet + after;
@@ -683,41 +1473,303 @@ function applySlashSelection() {
 }
 
 function positionSlashMenu() {
-  const ta = document.getElementById('noteBody');
-  const coords = getCaretCoords(ta, slashStartPos);
-  const menu = document.getElementById('slashMenu');
-  const taRect = ta.getBoundingClientRect();
-  // Position below the caret with a small offset.
-  let left = taRect.left + coords.left - ta.scrollLeft;
-  let top = taRect.top + coords.top - ta.scrollTop + 24;
-  // Clamp to viewport
-  const menuWidth = 240;
-  if (left + menuWidth > window.innerWidth - 12) {
-    left = window.innerWidth - menuWidth - 12;
-  }
-  menu.style.left = `${Math.max(8, left)}px`;
-  menu.style.top  = `${top}px`;
+  positionFloatingMenu(document.getElementById('slashMenu'), slashStartPos, 240);
 }
 
 // Compute caret pixel coords inside a textarea using a hidden mirror element.
+// Returns coords relative to the textarea's content origin (i.e. inside its
+// padding/border) so callers just add the textarea's content-area offset.
 function getCaretCoords(textarea, position) {
   const mirror = document.getElementById('caretMirror');
   const cs = window.getComputedStyle(textarea);
   const props = [
-    'boxSizing','width','height','overflowX','overflowY',
+    'boxSizing','width','overflowX','overflowY',
     'borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth',
     'paddingTop','paddingRight','paddingBottom','paddingLeft',
     'fontStyle','fontVariant','fontWeight','fontStretch','fontSize','fontSizeAdjust','lineHeight','fontFamily',
     'textAlign','textTransform','textIndent','textDecoration','letterSpacing','wordSpacing','tabSize'
   ];
   props.forEach(p => { mirror.style[p] = cs[p]; });
+  // Mirror should grow vertically with content so we get a real offsetTop.
+  mirror.style.height = 'auto';
+  mirror.style.minHeight = cs.height;
+
   mirror.textContent = textarea.value.slice(0, position);
   const span = document.createElement('span');
-  span.textContent = textarea.value.slice(position) || '.';
+  // Use a zero-width but visible character so offsetLeft/Top reflect the caret.
+  span.textContent = '​';
   mirror.appendChild(span);
-  const left = span.offsetLeft;
-  const top = span.offsetTop;
-  return { left, top };
+  // span.offsetLeft / Top are measured from the mirror's padding edge — i.e.
+  // already include the textarea's padding contribution (since mirror copies
+  // the textarea padding). Subtract padding to get a pure content-relative
+  // offset that we can re-add explicitly.
+  const padLeft = parseFloat(cs.paddingLeft) || 0;
+  const padTop  = parseFloat(cs.paddingTop)  || 0;
+  const lineHeight = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.4) || 18;
+  const left = span.offsetLeft - padLeft;
+  const top  = span.offsetTop  - padTop;
+  return { left, top, lineHeight };
+}
+
+// Anchor a floating menu just below the caret in the notes textarea.
+// Flips above the line if it would overflow the viewport bottom; clamps to
+// horizontal viewport edges so it never half-renders off-screen.
+function positionFloatingMenu(menu, caretPos, menuWidth) {
+  if (!menu) return;
+  const ta = document.getElementById('noteBody');
+  const taRect = ta.getBoundingClientRect();
+  const cs = window.getComputedStyle(ta);
+  const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
+  const borderTop  = parseFloat(cs.borderTopWidth)  || 0;
+  const padLeft    = parseFloat(cs.paddingLeft)     || 0;
+  const padTop     = parseFloat(cs.paddingTop)      || 0;
+
+  const coords = getCaretCoords(ta, caretPos);
+
+  const caretX = taRect.left + borderLeft + padLeft + coords.left - ta.scrollLeft;
+  const caretLineTop = taRect.top + borderTop + padTop + coords.top - ta.scrollTop;
+  const caretLineBottom = caretLineTop + coords.lineHeight;
+
+  // Use the rendered menu size if available; fall back to an estimate so the
+  // first paint isn't off.
+  const menuRect = menu.getBoundingClientRect();
+  const menuH = menuRect.height || 280;
+  const menuW = menuRect.width  || menuWidth;
+
+  const margin = 8;
+  const gap = 4;
+
+  let top = caretLineBottom + gap;
+  if (top + menuH > window.innerHeight - margin) {
+    const above = caretLineTop - menuH - gap;
+    top = above >= margin ? above : Math.max(margin, window.innerHeight - menuH - margin);
+  }
+
+  let left = caretX;
+  if (left + menuW > window.innerWidth - margin) {
+    left = window.innerWidth - menuW - margin;
+  }
+  if (left < margin) left = margin;
+
+  // Keep the menu within the textarea's left edge so it doesn't drift far left
+  // when the caret is near the start of a wrapped line at the top.
+  const taLeftMin = Math.max(margin, taRect.left);
+  if (left < taLeftMin) left = taLeftMin;
+
+  menu.style.left = `${left}px`;
+  menu.style.top  = `${top}px`;
+}
+
+// ============================================================
+// AI slash commands (/ai summarize|rewrite|expand)
+// ============================================================
+
+// Module-load assertion: every AI slash entry must have a matching system prompt,
+// otherwise applySlashSelection silently fails and the typo is hard to spot.
+for (const item of SLASH_ITEMS) {
+  if (item.aiMode && !AI_SYSTEM_PROMPTS[item.aiMode]) {
+    console.error(`SLASH_ITEMS aiMode "${item.aiMode}" has no entry in AI_SYSTEM_PROMPTS`);
+  }
+}
+
+// For rewrite/expand: returns the trailing paragraph (block separated from the
+// rest by a blank line) of `textBeforeSlash` — i.e. what the user just finished.
+function findPrecedingParagraph(textBeforeSlash) {
+  const trimmed = textBeforeSlash.replace(/[ \t\r\n]*$/, '');
+  if (!trimmed) return { start: 0, end: 0, text: '' };
+  const blocks = trimmed.split(/\n\s*\n/);
+  const last = blocks[blocks.length - 1] || '';
+  const start = trimmed.length - last.length;
+  return { start, end: trimmed.length, text: last };
+}
+
+async function runAiCommand(mode, slashStart, slashEnd) {
+  if (aiRunning || !selectedId) return;
+
+  const ta = document.getElementById('noteBody');
+  const fullText = ta.value;
+  const beforeSlash = fullText.slice(0, slashStart);
+  const afterSlash = fullText.slice(slashEnd);
+
+  let inputText;
+  let replaceStart;
+  let replaceEnd;
+  let leadingPad = '';
+
+  if (mode === 'summarize') {
+    inputText = (beforeSlash + afterSlash).trim();
+    if (!inputText) {
+      flashAiLoaderError('Note is empty — nothing to summarize');
+      return;
+    }
+    replaceStart = slashStart;
+    replaceEnd = slashEnd;
+    if (beforeSlash.length > 0 && !/\n\s*$/.test(beforeSlash)) {
+      leadingPad = '\n\n';
+    }
+  } else {
+    const para = findPrecedingParagraph(beforeSlash);
+    if (!para.text.trim()) {
+      flashAiLoaderError(`No paragraph above to ${mode}`);
+      return;
+    }
+    inputText = para.text;
+    replaceStart = para.start;
+    replaceEnd = slashEnd;
+  }
+
+  const system = AI_SYSTEM_PROMPTS[mode];
+  if (!system) return;
+
+  ta.value = ta.value.slice(0, replaceStart) + leadingPad + ta.value.slice(replaceEnd);
+  const insertAt = replaceStart + leadingPad.length;
+  let insertedLen = 0;
+
+  // Lock the textarea so user edits don't shift our insertion point mid-stream.
+  ta.readOnly = true;
+  aiRunning = true;
+  dirty = true;
+
+  ta.focus();
+  ta.setSelectionRange(insertAt, insertAt);
+  ta.scrollTop = Math.max(0, getCaretCoords(ta, insertAt).top - 40);
+  showAiLoader(mode);
+
+  let totalTokens = 0;
+
+  // Buffer deltas and flush once per animation frame. Per-token splices into a
+  // long textarea are O(N) each plus a forced reflow from setting scrollTop;
+  // batching keeps the cost amortized regardless of token rate.
+  let pendingDelta = '';
+  let rafScheduled = false;
+  const flush = () => {
+    rafScheduled = false;
+    if (!pendingDelta) return;
+    const cursor = insertAt + insertedLen;
+    ta.value = ta.value.slice(0, cursor) + pendingDelta + ta.value.slice(cursor);
+    insertedLen += pendingDelta.length;
+    pendingDelta = '';
+    ta.scrollTop = ta.scrollHeight;
+    schedulePreviewRender();
+  };
+
+  const onEvent = new Channel();
+  let errored = false;
+  onEvent.onmessage = (evt) => {
+    if (evt.kind === 'chunk') {
+      pendingDelta += evt.delta;
+      totalTokens += 1;
+      updateAiLoaderTokens(totalTokens);
+      if (!rafScheduled) {
+        rafScheduled = true;
+        requestAnimationFrame(flush);
+      }
+    } else if (evt.kind === 'error') {
+      errored = true;
+      flashAiLoaderError(evt.message || 'AI request failed');
+    }
+  };
+
+  try {
+    await invoke('chat_completion', {
+      messages: [{ role: 'user', content: inputText }],
+      opts: { system, temperature: 0.4 },
+      onEvent,
+    });
+    flush(); // drain any final buffered tokens
+  } catch (e) {
+    const msg = typeof e === 'string' ? e : (e?.message || String(e));
+    flashAiLoaderError(msg);
+  } finally {
+    flush();
+    hideAiLoader();
+    ta.readOnly = false;
+    aiRunning = false;
+    const caret = insertAt + insertedLen;
+    ta.focus();
+    ta.setSelectionRange(caret, caret);
+    updateWordCount();
+    schedulePreviewRender();
+    scheduleSave();
+  }
+}
+
+// ============================================================
+// Claude-Code-style loader bar shown above the textarea while AI runs.
+// JS-driven braille spinner (CSS can't reliably animate `content` cycling).
+// ============================================================
+
+const SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+const VERB_BY_MODE = {
+  summarize: 'Summarizing',
+  rewrite:   'Rewriting',
+  expand:    'Expanding',
+};
+let aiLoaderSpinnerTimer = null;
+let aiLoaderTimeTimer = null;
+let aiLoaderErrorTimer = null;
+let aiLoaderStartedAt = 0;
+
+function showAiLoader(mode) {
+  const el = document.getElementById('aiLoader');
+  if (!el) return;
+  if (aiLoaderErrorTimer) { clearTimeout(aiLoaderErrorTimer); aiLoaderErrorTimer = null; }
+  el.classList.remove('hidden', 'is-error');
+  document.getElementById('aiLoaderLabel').textContent = VERB_BY_MODE[mode] || 'Generating';
+  document.getElementById('aiLoaderTokens').textContent = '';
+  aiLoaderStartedAt = Date.now();
+  updateAiLoaderTime();
+
+  let frame = 0;
+  const spinnerEl = document.getElementById('aiLoaderSpinner');
+  spinnerEl.textContent = SPINNER_FRAMES[0];
+  if (aiLoaderSpinnerTimer) clearInterval(aiLoaderSpinnerTimer);
+  aiLoaderSpinnerTimer = setInterval(() => {
+    frame = (frame + 1) % SPINNER_FRAMES.length;
+    spinnerEl.textContent = SPINNER_FRAMES[frame];
+  }, 80);
+
+  if (aiLoaderTimeTimer) clearInterval(aiLoaderTimeTimer);
+  aiLoaderTimeTimer = setInterval(updateAiLoaderTime, 1000);
+}
+
+function updateAiLoaderTime() {
+  const el = document.getElementById('aiLoaderTime');
+  if (!el || !aiLoaderStartedAt) return;
+  const secs = Math.floor((Date.now() - aiLoaderStartedAt) / 1000);
+  el.textContent = `${secs}s`;
+}
+
+function updateAiLoaderTokens(n) {
+  const el = document.getElementById('aiLoaderTokens');
+  if (!el) return;
+  el.textContent = `${n} tok`;
+}
+
+function hideAiLoader() {
+  if (aiLoaderSpinnerTimer) { clearInterval(aiLoaderSpinnerTimer); aiLoaderSpinnerTimer = null; }
+  if (aiLoaderTimeTimer)    { clearInterval(aiLoaderTimeTimer);    aiLoaderTimeTimer = null; }
+  if (aiLoaderErrorTimer) return; // let the error flash linger its full duration
+  const el = document.getElementById('aiLoader');
+  if (el) { el.classList.add('hidden'); el.classList.remove('is-error'); }
+}
+
+function flashAiLoaderError(message) {
+  const el = document.getElementById('aiLoader');
+  if (!el) return;
+  if (aiLoaderSpinnerTimer) { clearInterval(aiLoaderSpinnerTimer); aiLoaderSpinnerTimer = null; }
+  if (aiLoaderTimeTimer)    { clearInterval(aiLoaderTimeTimer);    aiLoaderTimeTimer = null; }
+  el.classList.add('is-error');
+  el.classList.remove('hidden');
+  document.getElementById('aiLoaderSpinner').textContent = '✕';
+  document.getElementById('aiLoaderLabel').textContent = message.slice(0, 120);
+  document.getElementById('aiLoaderTokens').textContent = '';
+  if (aiLoaderErrorTimer) clearTimeout(aiLoaderErrorTimer);
+  aiLoaderErrorTimer = setTimeout(() => {
+    aiLoaderErrorTimer = null;
+    el.classList.add('hidden');
+    el.classList.remove('is-error');
+  }, 4000);
 }
 
 // ============================================================
@@ -806,18 +1858,7 @@ function applyWikiSelection() {
 }
 
 function positionWikiMenu() {
-  const ta = document.getElementById('noteBody');
-  const coords = getCaretCoords(ta, wikiStartPos);
-  const menu = document.getElementById('wikiMenu');
-  const taRect = ta.getBoundingClientRect();
-  let left = taRect.left + coords.left - ta.scrollLeft;
-  let top = taRect.top + coords.top - ta.scrollTop + 24;
-  const menuWidth = 280;
-  if (left + menuWidth > window.innerWidth - 12) {
-    left = window.innerWidth - menuWidth - 12;
-  }
-  menu.style.left = `${Math.max(8, left)}px`;
-  menu.style.top  = `${top}px`;
+  positionFloatingMenu(document.getElementById('wikiMenu'), wikiStartPos, 280);
 }
 
 // Returns true when `pos` falls inside a fenced code block (```...```).
@@ -1095,9 +2136,7 @@ function bindEvents() {
   document.getElementById('previewToggle').addEventListener('click', togglePreview);
   document.getElementById('listToggleBtn').addEventListener('click', toggleListCollapsed);
 
-  ['noteTitle', 'noteTags'].forEach(id => {
-    document.getElementById(id).addEventListener('input', onMetaInput);
-  });
+  document.getElementById('noteTitle').addEventListener('input', onMetaInput);
 
   const body = document.getElementById('noteBody');
   body.addEventListener('input', onBodyInput);
@@ -1273,6 +2312,21 @@ function bindEvents() {
   // Open notes folder
   document.getElementById('openNotesFolderBtn')?.addEventListener('click', async () => {
     try { await invoke('open_notes_folder'); } catch (e) { console.error(e); }
+  });
+
+  // New folder button (settings panel is wired globally in main.js)
+  document.getElementById('newFolderBtn')?.addEventListener('click', () => createFolderUi(activeFolder || ''));
+  // New tag button in settings
+  document.getElementById('tagManagerNewBtn')?.addEventListener('click', createTagUi);
+
+  // Tag manager search + bulk actions
+  document.getElementById('tagManagerSearch')?.addEventListener('input', e => {
+    tagSearchQuery = e.target.value;
+    renderTagManager();
+  });
+  document.getElementById('tagManagerBulk')?.addEventListener('click', e => {
+    const act = e.target?.dataset?.bulkAction;
+    if (act) bulkTagAction(act);
   });
 
   // Persist save before window unload

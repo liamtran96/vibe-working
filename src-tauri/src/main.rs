@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod llm;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -7,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,8 @@ struct Repo {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
     repos: Vec<Repo>,
+    #[serde(default)]
+    llm: llm::LlmConfig,
 }
 
 struct RunningProcess {
@@ -41,7 +46,7 @@ struct AppState {
 }
 
 fn get_config_dir() -> PathBuf {
-    let config_dir = directories::ProjectDirs::from("com", "repo-launcher", "RepoLauncher")
+    let config_dir = directories::ProjectDirs::from("com", "vibe-working", "VibeWorking")
         .map(|d| d.config_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
@@ -55,6 +60,12 @@ fn get_config_path() -> PathBuf {
 
 fn notes_dir() -> PathBuf {
     let dir = get_config_dir().join("notes");
+    fs::create_dir_all(&dir).ok();
+    dir
+}
+
+fn chats_dir() -> PathBuf {
+    let dir = get_config_dir().join("chats");
     fs::create_dir_all(&dir).ok();
     dir
 }
@@ -382,6 +393,81 @@ struct Note {
     #[serde(default)]
     created_at: u64,
     updated_at: u64,
+    #[serde(default)]
+    folder: String,
+}
+
+// Validate a folder path supplied by the frontend or read from frontmatter.
+// Rejects absolute paths, traversal segments, empty segments, and bad chars;
+// normalises separators to "/". Empty input is the root, which is allowed.
+fn sanitize_folder(input: &str) -> Result<String, String> {
+    let trimmed = input.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.starts_with('/') {
+        return Err("Folder path must be relative".to_string());
+    }
+    let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return Ok(String::new());
+    }
+    for p in &parts {
+        if *p == ".." || *p == "." {
+            return Err("Folder path may not contain . or ..".to_string());
+        }
+        if p.chars()
+            .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return Err("Folder name contains an invalid character".to_string());
+        }
+        if p.starts_with(' ') || p.ends_with(' ') {
+            return Err("Folder name may not start or end with a space".to_string());
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+// Recursively collect every `.md` file under `dir`.
+fn walk_note_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("md")
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+// Compute the folder field (relative path with `/` separators) for a note
+// file that lives somewhere under `notes_dir`. Returns "" for root.
+fn folder_for_path(path: &Path) -> String {
+    let root = notes_dir();
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let rel = match parent.strip_prefix(&root) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 fn now_secs() -> u64 {
@@ -426,17 +512,11 @@ fn note_filename(title: &str, id: &str) -> String {
     format!("{}--{}.md", slugify(title), id)
 }
 
-// Find an existing note file for `id`. Supports both the new
-// `{slug}--{id}.md` layout and legacy `{id}.md` files.
+// Find an existing note file for `id` anywhere under notes_dir (any subfolder).
+// Supports both `{slug}--{id}.md` and legacy `{id}.md` filenames.
 fn find_note_path(id: &str) -> Option<PathBuf> {
-    let dir = notes_dir();
-    let entries = fs::read_dir(&dir).ok()?;
     let suffix = format!("--{}", id);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
+    for path in walk_note_files(&notes_dir()) {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             if stem == id || stem.ends_with(&suffix) {
                 return Some(path);
@@ -473,6 +553,7 @@ fn parse_note_file(path: &Path) -> Option<Note> {
     let mut pinned = false;
     let mut created_at: u64 = 0;
     let mut updated_at: u64 = 0;
+    let mut folder_field: Option<String> = None;
     let mut frontmatter_end = false;
 
     for line in lines.by_ref() {
@@ -490,6 +571,7 @@ fn parse_note_file(path: &Path) -> Option<Note> {
                 "pinned" => pinned = value == "true",
                 "created_at" => created_at = value.parse().unwrap_or(0),
                 "updated_at" => updated_at = value.parse().unwrap_or(0),
+                "folder" => folder_field = Some(value.to_string()),
                 _ => {}
             }
         }
@@ -506,6 +588,13 @@ fn parse_note_file(path: &Path) -> Option<Note> {
         created_at = updated_at;
     }
 
+    // Folder is path-derived by default; honour an explicit frontmatter value
+    // if it sanitises cleanly (covers manually-edited or legacy files).
+    let folder = match folder_field {
+        Some(raw) => sanitize_folder(&raw).unwrap_or_else(|_| folder_for_path(path)),
+        None => folder_for_path(path),
+    };
+
     Some(Note {
         id,
         title,
@@ -514,6 +603,7 @@ fn parse_note_file(path: &Path) -> Option<Note> {
         pinned,
         created_at,
         updated_at,
+        folder,
     })
 }
 
@@ -530,31 +620,39 @@ fn write_note_file(note: &Note, path: &Path) -> Result<(), String> {
         .join(", ");
 
     let contents = format!(
-        "---\nid: {}\ntitle: {}\ntags: [{}]\npinned: {}\ncreated_at: {}\nupdated_at: {}\n---\n{}",
+        "---\nid: {}\ntitle: {}\ntags: [{}]\npinned: {}\nfolder: {}\ncreated_at: {}\nupdated_at: {}\n---\n{}",
         note.id,
         escape_frontmatter(&note.title),
         tags_line,
         note.pinned,
+        escape_frontmatter(&note.folder),
         note.created_at,
         note.updated_at,
         note.body,
     );
 
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     fs::write(path, contents).map_err(|e| e.to_string())
+}
+
+// Resolve the on-disk path for a note given its folder + slug + id.
+fn note_path_for(folder: &str, title: &str, id: &str) -> PathBuf {
+    let mut p = notes_dir();
+    if !folder.is_empty() {
+        for seg in folder.split('/').filter(|s| !s.is_empty()) {
+            p.push(seg);
+        }
+    }
+    p.push(note_filename(title, id));
+    p
 }
 
 #[tauri::command]
 fn get_notes() -> Vec<Note> {
-    let dir = notes_dir();
-    let entries = match fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut notes: Vec<Note> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+    let mut notes: Vec<Note> = walk_note_files(&notes_dir())
+        .into_iter()
         .filter_map(|p| parse_note_file(&p))
         .collect();
 
@@ -568,7 +666,8 @@ fn get_notes() -> Vec<Note> {
 }
 
 #[tauri::command]
-fn create_note(title: String) -> Result<Note, String> {
+fn create_note(title: String, folder: Option<String>) -> Result<Note, String> {
+    let folder = sanitize_folder(folder.as_deref().unwrap_or(""))?;
     let now = now_secs();
     let note = Note {
         id: uuid_simple(),
@@ -582,8 +681,9 @@ fn create_note(title: String) -> Result<Note, String> {
         pinned: false,
         created_at: now,
         updated_at: now,
+        folder,
     };
-    let path = notes_dir().join(note_filename(&note.title, &note.id));
+    let path = note_path_for(&note.folder, &note.title, &note.id);
     write_note_file(&note, &path)?;
     Ok(note)
 }
@@ -595,7 +695,9 @@ fn update_note(
     body: String,
     tags: Vec<String>,
     pinned: bool,
+    folder: String,
 ) -> Result<Note, String> {
+    let folder = sanitize_folder(&folder)?;
     let existing_path = find_note_path(&id).ok_or("Note not found")?;
     let existing_created = parse_note_file(&existing_path)
         .map(|n| n.created_at)
@@ -609,8 +711,9 @@ fn update_note(
         pinned,
         created_at: if existing_created == 0 { now } else { existing_created },
         updated_at: now,
+        folder,
     };
-    let desired_path = notes_dir().join(note_filename(&note.title, &note.id));
+    let desired_path = note_path_for(&note.folder, &note.title, &note.id);
     write_note_file(&note, &desired_path)?;
     if existing_path != desired_path {
         let _ = fs::remove_file(&existing_path);
@@ -641,14 +744,484 @@ fn open_notes_folder() -> Result<(), String> {
     Ok(())
 }
 
+// ---------- Folder management ----------
+
+#[tauri::command]
+fn list_folders() -> Vec<String> {
+    let root = notes_dir();
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        let entries = match fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(&root) {
+                let s = rel.to_string_lossy().replace('\\', "/");
+                if !s.is_empty() {
+                    out.push(s);
+                }
+            }
+            stack.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tauri::command]
+fn create_folder(path: String) -> Result<(), String> {
+    let folder = sanitize_folder(&path)?;
+    if folder.is_empty() {
+        return Err("Folder name is required".to_string());
+    }
+    let mut target = notes_dir();
+    for seg in folder.split('/').filter(|s| !s.is_empty()) {
+        target.push(seg);
+    }
+    fs::create_dir_all(&target).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rename_folder(old: String, new: String) -> Result<(), String> {
+    let old = sanitize_folder(&old)?;
+    let new = sanitize_folder(&new)?;
+    if old.is_empty() || new.is_empty() {
+        return Err("Folder name is required".to_string());
+    }
+    if old == new {
+        return Ok(());
+    }
+    let root = notes_dir();
+    let mut old_path = root.clone();
+    for seg in old.split('/').filter(|s| !s.is_empty()) {
+        old_path.push(seg);
+    }
+    let mut new_path = root.clone();
+    for seg in new.split('/').filter(|s| !s.is_empty()) {
+        new_path.push(seg);
+    }
+    if !old_path.exists() {
+        return Err("Source folder does not exist".to_string());
+    }
+    if new_path.exists() {
+        return Err("Target folder already exists".to_string());
+    }
+    if let Some(parent) = new_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
+    // Rewrite the `folder:` frontmatter line in every note inside the renamed
+    // tree so external editors see the updated value too.
+    for note_path in walk_note_files(&new_path) {
+        if let Some(mut note) = parse_note_file(&note_path) {
+            note.folder = folder_for_path(&note_path);
+            let _ = write_note_file(&note, &note_path);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_folder(path: String, mode: String) -> Result<(), String> {
+    let folder = sanitize_folder(&path)?;
+    if folder.is_empty() {
+        return Err("Cannot delete the root folder".to_string());
+    }
+    let root = notes_dir();
+    let mut target = root.clone();
+    for seg in folder.split('/').filter(|s| !s.is_empty()) {
+        target.push(seg);
+    }
+    if !target.exists() {
+        return Ok(()); // already gone
+    }
+    match mode.as_str() {
+        "move-to-root" => {
+            for note_path in walk_note_files(&target) {
+                if let Some(mut note) = parse_note_file(&note_path) {
+                    note.folder = String::new();
+                    let dest = note_path_for("", &note.title, &note.id);
+                    write_note_file(&note, &dest)?;
+                    if dest != note_path {
+                        let _ = fs::remove_file(&note_path);
+                    }
+                }
+            }
+            fs::remove_dir_all(&target).map_err(|e| e.to_string())
+        }
+        "delete" => fs::remove_dir_all(&target).map_err(|e| e.to_string()),
+        other => Err(format!("Unknown delete mode: {}", other)),
+    }
+}
+
+// ---------- Tag management ----------
+
+fn tag_registry_path() -> PathBuf {
+    get_config_dir().join("tags.json")
+}
+
+fn load_tag_registry() -> Vec<String> {
+    fs::read_to_string(tag_registry_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_tag_registry(tags: &[String]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(tags).map_err(|e| e.to_string())?;
+    fs::write(tag_registry_path(), json).map_err(|e| e.to_string())
+}
+
+fn case_insensitive_contains(list: &[String], name: &str) -> bool {
+    list.iter().any(|t| t.eq_ignore_ascii_case(name))
+}
+
+#[tauri::command]
+fn list_all_tags() -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for t in load_tag_registry() {
+        set.insert(t);
+    }
+    // Auto-include any tag that already appears on a note so legacy data
+    // surfaces in the manager even if it was never explicitly registered.
+    for path in walk_note_files(&notes_dir()) {
+        if let Some(n) = parse_note_file(&path) {
+            for t in n.tags {
+                if !set.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+                    set.insert(t);
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+#[tauri::command]
+fn create_tag(name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Tag name is required".to_string());
+    }
+    let mut registry = load_tag_registry();
+    if case_insensitive_contains(&registry, &name) {
+        return Err(format!("Tag “{}” already exists", name));
+    }
+    registry.push(name);
+    save_tag_registry(&registry)
+}
+
+// Helper: walk every note, apply `mutate` to its tags. If the closure returns
+// true (tags changed), bump updated_at and rewrite the file. Returns the
+// number of files that actually changed.
+fn mutate_all_tags<F>(mut mutate: F) -> Result<usize, String>
+where
+    F: FnMut(&mut Vec<String>) -> bool,
+{
+    let now = now_secs();
+    let mut count = 0usize;
+    for path in walk_note_files(&notes_dir()) {
+        if let Some(mut note) = parse_note_file(&path) {
+            if mutate(&mut note.tags) {
+                note.updated_at = now;
+                write_note_file(&note, &path)?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn dedupe_preserve_order(v: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|t| seen.insert(t.clone()));
+}
+
+#[tauri::command]
+fn rename_tag(old: String, new: String) -> Result<usize, String> {
+    let old = old.trim().to_string();
+    let new = new.trim().to_string();
+    if old.is_empty() || new.is_empty() {
+        return Err("Tag name is required".to_string());
+    }
+    if old == new {
+        return Ok(0);
+    }
+    let count = mutate_all_tags(|tags| {
+        if !tags.iter().any(|t| t == &old) {
+            return false;
+        }
+        for t in tags.iter_mut() {
+            if *t == old {
+                *t = new.clone();
+            }
+        }
+        dedupe_preserve_order(tags);
+        true
+    })?;
+    let mut registry = load_tag_registry();
+    let mut changed = false;
+    for t in registry.iter_mut() {
+        if *t == old {
+            *t = new.clone();
+            changed = true;
+        }
+    }
+    if !case_insensitive_contains(&registry, &new) {
+        registry.push(new);
+        changed = true;
+    }
+    if changed {
+        dedupe_preserve_order(&mut registry);
+        save_tag_registry(&registry)?;
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+fn delete_tag(name: String) -> Result<usize, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Tag name is required".to_string());
+    }
+    let count = mutate_all_tags(|tags| {
+        let before = tags.len();
+        tags.retain(|t| t != &name);
+        tags.len() != before
+    })?;
+    let mut registry = load_tag_registry();
+    let before = registry.len();
+    registry.retain(|t| t != &name);
+    if registry.len() != before {
+        save_tag_registry(&registry)?;
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+fn merge_tags(from: String, into: String) -> Result<usize, String> {
+    let from = from.trim().to_string();
+    let into = into.trim().to_string();
+    if from.is_empty() || into.is_empty() {
+        return Err("Tag name is required".to_string());
+    }
+    if from == into {
+        return Ok(0);
+    }
+    let count = mutate_all_tags(|tags| {
+        if !tags.iter().any(|t| t == &from) {
+            return false;
+        }
+        for t in tags.iter_mut() {
+            if *t == from {
+                *t = into.clone();
+            }
+        }
+        dedupe_preserve_order(tags);
+        true
+    })?;
+    let mut registry = load_tag_registry();
+    let before_len = registry.len();
+    registry.retain(|t| t != &from);
+    if !case_insensitive_contains(&registry, &into) {
+        registry.push(into);
+    }
+    if registry.len() != before_len {
+        save_tag_registry(&registry)?;
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+fn count_notes_with_tag(name: String) -> usize {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return 0;
+    }
+    walk_note_files(&notes_dir())
+        .into_iter()
+        .filter_map(|p| parse_note_file(&p))
+        .filter(|n| n.tags.iter().any(|t| t == &name))
+        .count()
+}
+
 fn uuid_simple() -> String {
     let duration = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     format!("{:x}{:x}", duration.as_secs(), duration.subsec_nanos())
 }
 
+// ============================================================
+// LLM (Gemma via llama.cpp)
+// ============================================================
+
+#[tauri::command]
+fn get_llm_config() -> llm::LlmConfig {
+    load_config().llm
+}
+
+#[tauri::command]
+fn set_llm_config(config: llm::LlmConfig) -> Result<(), String> {
+    let mut cfg = load_config();
+    cfg.llm = config;
+    save_config(&cfg)
+}
+
+#[tauri::command]
+async fn chat_completion(
+    messages: Vec<llm::ChatMessage>,
+    opts: Option<llm::ChatOpts>,
+    on_event: Channel<llm::ChatEvent>,
+) -> Result<String, String> {
+    let config = load_config().llm;
+    llm::chat_completion_impl(config, on_event, messages, opts).await
+}
+
+#[tauri::command]
+async fn llm_health() -> bool {
+    let config = load_config().llm;
+    llm::llm_health_impl(config).await
+}
+
+// ============================================================
+// Chats (conversation persistence)
+// ============================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Chat {
+    id: String,
+    title: String,
+    #[serde(default)]
+    messages: Vec<llm::ChatMessage>,
+    #[serde(default)]
+    created_at: u64,
+    updated_at: u64,
+}
+
+fn chat_path(id: &str) -> PathBuf {
+    chats_dir().join(format!("{}.json", id))
+}
+
+// Lightweight projection of `Chat` for the sidebar list — skips the (potentially
+// large) `messages` array so opening the Chat view doesn't deserialize every
+// conversation in full.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMeta {
+    id: String,
+    title: String,
+    #[serde(default)]
+    message_count: usize,
+    #[serde(default)]
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Deserialize)]
+struct ChatMetaRaw {
+    id: String,
+    #[serde(default)]
+    title: String,
+    // IgnoredAny skips the message contents while still counting array entries —
+    // avoids allocating String/role/content for every message just to render the count.
+    #[serde(default)]
+    messages: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    updated_at: u64,
+}
+
+#[tauri::command]
+fn list_chats() -> Vec<ChatMeta> {
+    let entries = match fs::read_dir(chats_dir()) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut chats: Vec<ChatMeta> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter_map(|p| {
+            let raw: ChatMetaRaw = fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())?;
+            Some(ChatMeta {
+                id: raw.id,
+                title: raw.title,
+                message_count: raw.messages.len(),
+                created_at: raw.created_at,
+                updated_at: raw.updated_at,
+            })
+        })
+        .collect();
+
+    chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    chats
+}
+
+#[tauri::command]
+fn get_chat(id: String) -> Result<Chat, String> {
+    let path = chat_path(&id);
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_chat(title: Option<String>) -> Result<Chat, String> {
+    let now = now_secs();
+    let chat = Chat {
+        id: uuid_simple(),
+        title: title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "New chat".to_string()),
+        messages: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    save_chat_to_disk(&chat)?;
+    Ok(chat)
+}
+
+#[tauri::command]
+fn save_chat(chat: Chat) -> Result<Chat, String> {
+    let mut chat = chat;
+    chat.updated_at = now_secs();
+    if chat.created_at == 0 {
+        chat.created_at = chat.updated_at;
+    }
+    save_chat_to_disk(&chat)?;
+    Ok(chat)
+}
+
+#[tauri::command]
+fn delete_chat(id: String) -> Result<(), String> {
+    match fs::remove_file(chat_path(&id)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn save_chat_to_disk(chat: &Chat) -> Result<(), String> {
+    let path = chat_path(&chat.id);
+    let json = serde_json::to_string_pretty(chat).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState {
             running_processes: Mutex::new(HashMap::new()),
         })
@@ -670,6 +1243,25 @@ fn main() {
             delete_note,
             get_notes_folder,
             open_notes_folder,
+            list_folders,
+            create_folder,
+            rename_folder,
+            delete_folder,
+            list_all_tags,
+            create_tag,
+            rename_tag,
+            delete_tag,
+            merge_tags,
+            count_notes_with_tag,
+            get_llm_config,
+            set_llm_config,
+            chat_completion,
+            llm_health,
+            list_chats,
+            get_chat,
+            create_chat,
+            save_chat,
+            delete_chat,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

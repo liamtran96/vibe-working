@@ -1,3 +1,5 @@
+import { appAlert, appConfirm, appPrompt } from './dialogs.js';
+
 // Wait for DOM and Tauri to be ready
 document.addEventListener('DOMContentLoaded', async () => {
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -11,9 +13,117 @@ document.addEventListener('DOMContentLoaded', async () => {
   initRouter();
   initSidebarToggle();
   initGlobalShortcuts();
+  initGlobalSettings();
 
   console.log('App initialized successfully');
 });
+
+function initGlobalSettings() {
+  const btn = document.getElementById('sidebarSettingsBtn');
+  if (!btn) return;
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const mod = await loadNotesModule();
+    await mod.initNotes?.();
+    mod.openSidebarSettings?.();
+  });
+
+  const close = document.getElementById('sidebarSettingsClose');
+  close?.addEventListener('click', () => {
+    document.getElementById('sidebarSettings')?.classList.add('hidden');
+  });
+  document.querySelector('#sidebarSettings .settings-modal-backdrop')
+    ?.addEventListener('click', () => {
+      document.getElementById('sidebarSettings')?.classList.add('hidden');
+    });
+
+  initUpdates();
+}
+
+function initUpdates() {
+  const btn = document.getElementById('checkUpdatesBtn');
+  if (!btn) return;
+
+  const statusEl = document.getElementById('updateStatus');
+  const progressWrap = document.getElementById('updateProgress');
+  const progressBar = document.getElementById('updateProgressBar');
+  const progressLabel = document.getElementById('updateProgressLabel');
+  const versionEl = document.getElementById('appVersion');
+
+  const setStatus = (text, kind = '') => {
+    statusEl.textContent = text || '';
+    statusEl.dataset.kind = kind;
+  };
+
+  window.__TAURI__.app.getVersion()
+    .then(v => { versionEl.textContent = v; })
+    .catch(() => { versionEl.textContent = 'unknown'; });
+
+  btn.addEventListener('click', async () => {
+    const { updater, process: proc } = window.__TAURI__;
+    if (!updater || !proc) {
+      setStatus('Updater plugin unavailable. Reinstall the app.', 'error');
+      return;
+    }
+
+    const errorByPhase = {
+      check: e => `Could not check for updates: ${e}`,
+      download: e => `Update failed: ${e}`,
+      relaunch: e => `Installed, but relaunch failed: ${e}. Please restart manually.`,
+    };
+    let phase = 'check';
+
+    btn.disabled = true;
+    setStatus('Checking for updates…');
+    progressWrap.classList.add('hidden');
+    progressBar.value = 0;
+    progressLabel.textContent = '0%';
+
+    try {
+      const update = await updater.check();
+      if (!update) {
+        setStatus('You are on the latest version.', 'ok');
+        return;
+      }
+
+      setStatus(`Update available: ${update.version}. Downloading…`);
+      progressWrap.classList.remove('hidden');
+
+      let downloaded = 0;
+      let contentLength = 0;
+      let lastPct = -1;
+
+      phase = 'download';
+      await update.downloadAndInstall(event => {
+        switch (event.event) {
+          case 'Started':
+            contentLength = event.data?.contentLength || 0;
+            break;
+          case 'Progress': {
+            downloaded += event.data?.chunkLength || 0;
+            if (contentLength <= 0) break;
+            const pct = Math.min(100, Math.round((downloaded / contentLength) * 100));
+            if (pct === lastPct) break;
+            progressBar.value = pct;
+            progressLabel.textContent = `${pct}%`;
+            lastPct = pct;
+            break;
+          }
+          case 'Finished':
+            setStatus('Installing… the app will restart in a moment.');
+            break;
+        }
+      });
+
+      phase = 'relaunch';
+      await proc.relaunch();
+    } catch (e) {
+      setStatus(errorByPhase[phase](e), 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
 
 let notesModulePromise = null;
 function loadNotesModule() {
@@ -21,6 +131,14 @@ function loadNotesModule() {
     notesModulePromise = import('./notes.js');
   }
   return notesModulePromise;
+}
+
+let chatModulePromise = null;
+function loadChatModule() {
+  if (!chatModulePromise) {
+    chatModulePromise = import('./chat.js');
+  }
+  return chatModulePromise;
 }
 
 function initGlobalShortcuts() {
@@ -60,16 +178,22 @@ function initRouter() {
     });
     document.getElementById('view-repos').classList.toggle('hidden', view !== 'repos');
     document.getElementById('view-notes').classList.toggle('hidden', view !== 'notes');
+    document.getElementById('view-chat').classList.toggle('hidden', view !== 'chat');
     document.querySelector('.view-host').scrollTop = 0;
 
     if (view === 'notes') {
       loadNotesModule().then(m => m.initNotes()).catch(err => {
         console.error('Failed to load notes module', err);
       });
+    } else if (view === 'chat') {
+      loadChatModule().then(m => m.initChat()).catch(err => {
+        console.error('Failed to load chat module', err);
+      });
     }
   }
 
   navItems.forEach(b => {
+    if (!b.dataset.view) return; // skip non-view items like Settings
     b.addEventListener('click', () => setView(b.dataset.view));
   });
 }
@@ -217,31 +341,33 @@ function initRepos() {
     try {
       const selected = await open({ directory: true, multiple: true, title: 'Select Repository Folders' });
       if (selected && selected.length > 0) {
-        const cmdInput = prompt(
+        const cmdInput = await appPrompt(
           'Enter commands (comma-separated). Shortcut "main,admin" expands to "npm run main" and "npm run admin". Or use "label=command, label2=command2":',
-          'main, admin'
+          { title: 'Commands', defaultValue: 'main, admin', okLabel: 'Next' }
         );
         if (cmdInput === null) return;
         const commands = parseCommandsInput(cmdInput);
         if (commands.length === 0) {
-          alert('Please enter at least one command.');
+          await appAlert('Please enter at least one command.', { title: 'Commands' });
           return;
         }
         for (const path of selected) {
           const defaultName = path.split(/[\\/]/).pop();
-          const name = prompt(`Enter a title for "${defaultName}":`, defaultName);
+          const name = await appPrompt(`Enter a title for "${defaultName}":`, {
+            title: 'Repository title', defaultValue: defaultName, okLabel: 'Add',
+          });
           if (name === null) return;
           await invoke('add_repo', {
             path: path,
             commands,
-            name: name || defaultName
+            name: name || defaultName,
           });
         }
         await loadRepos();
       }
     } catch (e) {
       console.error('addRepo error:', e);
-      alert('Error: ' + e);
+      await appAlert('Error: ' + e, { title: 'Error' });
     }
   }
 
@@ -249,29 +375,31 @@ function initRepos() {
     const repo = repos.find(r => r.id === id);
     if (!repo) return;
     const current = formatCommandsForEdit(repo.commands || []);
-    const input = prompt(
+    const input = await appPrompt(
       'Edit commands. Format: "label=command, label2=command2" (or just "label" to use "npm run label"):',
-      current
+      { title: 'Edit commands', defaultValue: current, okLabel: 'Save' }
     );
     if (input === null) return;
     const commands = parseCommandsInput(input);
     if (commands.length === 0) {
-      alert('Please enter at least one command.');
+      await appAlert('Please enter at least one command.', { title: 'Commands' });
       return;
     }
     try {
       await invoke('update_repo_commands', { id, commands });
       await loadRepos();
     } catch (e) {
-      alert('Error: ' + e);
+      await appAlert('Error: ' + e, { title: 'Error' });
     }
   }
 
   async function removeRepo(id) {
-    if (confirm('Remove this repository?')) {
-      await invoke('remove_repo', { id });
-      await loadRepos();
-    }
+    const ok = await appConfirm('Remove this repository?', {
+      title: 'Remove repository', okLabel: 'Remove', danger: true,
+    });
+    if (!ok) return;
+    await invoke('remove_repo', { id });
+    await loadRepos();
   }
 
   async function openInVSCode(id) {
@@ -280,7 +408,7 @@ function initRepos() {
       vscodeOpen[id] = true;
       renderRepos();
     } catch (e) {
-      alert('Error opening VS Code: ' + e);
+      await appAlert('Error opening VS Code: ' + e, { title: 'Error' });
     }
   }
 
@@ -294,7 +422,7 @@ function initRepos() {
       }
       renderRepos();
     } catch (e) {
-      alert('Error closing VS Code: ' + e);
+      await appAlert('Error closing VS Code: ' + e, { title: 'Error' });
     }
   }
 
@@ -306,7 +434,7 @@ function initRepos() {
       if (openVscode) vscodeOpen[id] = true;
       renderRepos();
     } catch (e) {
-      alert('Error: ' + e);
+      await appAlert('Error: ' + e, { title: 'Error' });
     }
   }
 
@@ -317,7 +445,7 @@ function initRepos() {
       runningLabels[id] = null;
       renderRepos();
     } catch (e) {
-      alert('Error: ' + e);
+      await appAlert('Error: ' + e, { title: 'Error' });
     }
   }
 
@@ -338,7 +466,7 @@ function initRepos() {
     const input = card.querySelector('.cmd-custom');
     const command = input && input.value.trim();
     if (!command) {
-      alert('Please enter a command.');
+      await appAlert('Please enter a command.', { title: 'Run command' });
       return;
     }
     try {
@@ -348,7 +476,7 @@ function initRepos() {
       selectedLabels[id] = savedLabel;
       await loadRepos();
     } catch (e) {
-      alert('Error: ' + e);
+      await appAlert('Error: ' + e, { title: 'Error' });
     }
   }
 
