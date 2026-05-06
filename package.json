@@ -1,6 +1,6 @@
 {
   "name": "vibe-working",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Vibe Working — a developer workspace for repos and notes",
   "scripts": {
     "tauri": "tauri",
