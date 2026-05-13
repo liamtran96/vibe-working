@@ -17,7 +17,6 @@ let editingTags = [];                   // mutable copy of selected note's tags
 let selectedId = null;
 let dirty = false;
 let saveTimer = null;
-let previewTimer = null;
 let lastSavedAt = 0;
 let searchQuery = '';
 let activeTag = null;
@@ -25,7 +24,20 @@ let activeFolder = null;                // null = "All"; "" = root only; "Work/Q
 let folderCollapsed = new Map();        // path -> bool
 let tagSelection = new Set();           // bulk-select in tag manager
 let tagSearchQuery = '';
-let showPreview = (localStorage.getItem('notesShowPreview') ?? '1') === '1';
+let folderFilter = '';
+let tagFilter = '';
+let tagSort = localStorage.getItem('notesTagSort') === 'name' ? 'name' : 'usage';
+
+// Per-block editor state. `source` is the canonical markdown for the open note;
+// `blocks` are tokenized regions (heading/paragraph/list/code/...) with offsets
+// into `source` so we can splice individual blocks back into the document.
+let editorState = {
+  source: '',
+  blocks: [],
+  editingBlockId: null,
+  blockSeq: 0,
+};
+
 let listCollapsed = localStorage.getItem('notesListCollapsed') === '1';
 let inited = false;
 let savedRelativeTimer = null;
@@ -52,7 +64,6 @@ function persistActiveFolder() {
 }
 
 const SAVE_DEBOUNCE_MS = 600;
-const PREVIEW_DEBOUNCE_MS = 100;
 const SLASH_ITEMS = [
   { key: 'h1',     title: 'Heading 1',     desc: 'Large section heading',   snippet: '# ' },
   { key: 'h2',     title: 'Heading 2',     desc: 'Medium section heading',  snippet: '## ' },
@@ -134,7 +145,7 @@ async function loadNotesFolderPath() {
     const folder = await invoke('get_notes_folder');
     const el = document.getElementById('notesFolderPath');
     if (el) {
-      el.textContent = folder;
+      el.textContent = formatFolderTail(folder);
       el.title = folder;
     }
     const btn = document.getElementById('openNotesFolderBtn');
@@ -142,6 +153,16 @@ async function loadNotesFolderPath() {
   } catch (e) {
     console.error('get_notes_folder error', e);
   }
+}
+
+// Show the last 2 segments of a path, preceded by an ellipsis when shortened.
+// Keeps the meaningful tail (".../VibeWorking/notes") visible without the
+// jagged-looking RTL truncation trick.
+function formatFolderTail(p) {
+  if (!p) return '';
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return p;
+  return '…' + (p.includes('\\') ? '\\' : '/') + parts.slice(-2).join(p.includes('\\') ? '\\' : '/');
 }
 
 export function openCommandPalette() {
@@ -179,16 +200,12 @@ async function loadNotes() {
 }
 
 function sortNotes() {
-  notes.sort((a, b) => {
-    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    return (b.updated_at || 0) - (a.updated_at || 0);
-  });
+  notes.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
 }
 
 function applyPersistedUiState() {
   document.getElementById('view-notes').classList.toggle('list-collapsed', listCollapsed);
   document.getElementById('listToggleBtn')?.classList.toggle('active', listCollapsed);
-  applyPreviewState();
 }
 
 function toggleListCollapsed() {
@@ -198,12 +215,252 @@ function toggleListCollapsed() {
   document.getElementById('listToggleBtn')?.classList.toggle('active', listCollapsed);
 }
 
-function applyPreviewState() {
-  const split = document.getElementById('editorSplit');
-  if (!split) return;
-  split.classList.toggle('preview-hidden', !showPreview);
-  const btn = document.getElementById('previewToggle');
-  if (btn) btn.classList.toggle('active', showPreview);
+// ============================================================
+// Block editor — Obsidian-style click-to-edit
+// ============================================================
+
+// Walk marked's lexer tokens, accumulating start/end offsets via raw.length.
+// Concatenated `block.source` is guaranteed to equal `source`.
+function tokenizeBlocks(source) {
+  const m = window.marked;
+  if (!m || typeof m.lexer !== 'function') {
+    return [{ id: 'b' + (++editorState.blockSeq), type: 'paragraph', source, start: 0, end: source.length }];
+  }
+  let tokens;
+  try {
+    tokens = m.lexer(source || '', { gfm: true, breaks: true });
+  } catch (e) {
+    console.error('lexer error', e);
+    return [{ id: 'b' + (++editorState.blockSeq), type: 'paragraph', source, start: 0, end: source.length }];
+  }
+  const blocks = [];
+  let cursor = 0;
+  for (const t of tokens) {
+    const raw = t.raw ?? '';
+    const start = cursor;
+    const end = cursor + raw.length;
+    blocks.push({
+      id: 'b' + (++editorState.blockSeq),
+      type: t.type,
+      source: raw,
+      start,
+      end,
+    });
+    cursor = end;
+  }
+  if (cursor < source.length) {
+    // Defensive: if marked drops trailing whitespace, append a space block so
+    // offsets round-trip and we don't lose user text.
+    blocks.push({
+      id: 'b' + (++editorState.blockSeq),
+      type: 'space',
+      source: source.slice(cursor),
+      start: cursor,
+      end: source.length,
+    });
+  }
+  return blocks;
+}
+
+function loadNoteIntoEditor(body) {
+  editorState.source = body || '';
+  editorState.blocks = tokenizeBlocks(editorState.source);
+  editorState.editingBlockId = null;
+  if (editorState.blocks.length === 0) {
+    // Synthesize an empty paragraph so the user has something to click into.
+    editorState.blocks = [{
+      id: 'b' + (++editorState.blockSeq),
+      type: 'paragraph',
+      source: '',
+      start: 0,
+      end: 0,
+    }];
+  }
+  renderBlocks();
+}
+
+function renderBlocks() {
+  const container = document.getElementById('noteBody');
+  if (!container) return;
+  const inner = document.createElement('div');
+  inner.className = 'note-blocks-inner';
+  for (const b of editorState.blocks) {
+    inner.appendChild(
+      b.id === editorState.editingBlockId ? buildBlockTextarea(b) : buildRenderedBlock(b)
+    );
+  }
+  container.replaceChildren(inner);
+  decorateWikiLinks(inner);
+}
+
+function buildRenderedBlock(b) {
+  const wrap = document.createElement('div');
+  wrap.className = `nb-block nb-${b.type}`;
+  wrap.dataset.blockId = b.id;
+  if (b.type === 'space') {
+    wrap.classList.add('nb-spacer');
+    return wrap;
+  }
+  const m = window.marked;
+  let html = '';
+  try {
+    if (m && typeof m.parse === 'function') {
+      html = m.parse(b.source || '', { gfm: true, breaks: true });
+    } else {
+      html = escapeHtml(b.source);
+    }
+  } catch (e) {
+    console.error('marked parse error', e);
+    html = escapeHtml(b.source);
+  }
+  const clean = window.DOMPurify ? window.DOMPurify.sanitize(html) : html;
+  wrap.innerHTML = clean;
+  return wrap;
+}
+
+function buildBlockTextarea(b) {
+  const ta = document.createElement('textarea');
+  ta.className = 'nb-block nb-editing';
+  ta.dataset.blockId = b.id;
+  ta.value = b.source;
+  ta.spellcheck = false;
+  ta.placeholder = b.type === 'paragraph' && !b.source ? 'Type / for blocks, [[ to link…' : '';
+  return ta;
+}
+
+function autosizeBlockTextarea(ta) {
+  if (!ta) return;
+  ta.style.height = 'auto';
+  ta.style.height = ta.scrollHeight + 'px';
+}
+
+function getActiveTextarea() {
+  if (!editorState.editingBlockId) return null;
+  return document.querySelector(
+    `textarea[data-block-id="${editorState.editingBlockId}"]`
+  );
+}
+
+function findBlockById(id) {
+  return editorState.blocks.find(b => b.id === id) || null;
+}
+
+function enterBlockEdit(blockId, clickX, clickY) {
+  if (editorState.editingBlockId === blockId) return;
+
+  const b = findBlockById(blockId);
+  if (!b) return;
+
+  // Resolve the caret while the original rendered DOM is still in place —
+  // committing a prior edit re-renders and would invalidate the click coords.
+  const sourceCaret = (typeof clickX === 'number' && typeof clickY === 'number')
+    ? mapClickToSourceOffset(b, clickX, clickY)
+    : visibleSourceLength(b.source);
+
+  if (editorState.editingBlockId) commitBlockEdit(editorState.editingBlockId);
+
+  editorState.editingBlockId = blockId;
+  renderBlocks();
+
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  autosizeBlockTextarea(ta);
+  ta.focus();
+  ta.setSelectionRange(sourceCaret, sourceCaret);
+}
+
+// End of visible text — excludes trailing newlines/whitespace so the caret
+// doesn't land on a blank line below the block.
+function visibleSourceLength(src) {
+  return (src || '').replace(/\s+$/, '').length;
+}
+
+// Map a click point to a caret offset in the block's markdown source.
+// Uses caretRangeFromPoint against the still-rendered block, computes the
+// rendered-text offset, then walks source and rendered text together,
+// skipping markdown syntax chars that don't appear in the rendered output.
+function mapClickToSourceOffset(block, clickX, clickY) {
+  if (!block.source) return 0;
+  const fallback = visibleSourceLength(block.source);
+
+  const blockEl = document.querySelector(`.nb-block[data-block-id="${block.id}"]`);
+  if (!blockEl) return fallback;
+
+  let node = null, offset = 0;
+  if (document.caretRangeFromPoint) {
+    const r = document.caretRangeFromPoint(clickX, clickY);
+    if (r) { node = r.startContainer; offset = r.startOffset; }
+  } else if (document.caretPositionFromPoint) {
+    const p = document.caretPositionFromPoint(clickX, clickY);
+    if (p) { node = p.offsetNode; offset = p.offset; }
+  }
+  if (!node || !blockEl.contains(node) || node.nodeType !== Node.TEXT_NODE) {
+    return fallback;
+  }
+
+  // Concatenate rendered text from the start of the block up to the caret.
+  let renderedBefore = '';
+  const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
+  let cur;
+  while ((cur = walker.nextNode())) {
+    if (cur === node) {
+      renderedBefore += cur.nodeValue.slice(0, offset);
+      break;
+    }
+    renderedBefore += cur.nodeValue;
+  }
+
+  // Walk source and renderedBefore in sync; skip source chars that aren't
+  // present in the rendered output (markdown syntax like #, *, [, ], (, ) ).
+  let si = 0, ri = 0;
+  const src = block.source;
+  while (ri < renderedBefore.length && si < src.length) {
+    if (src[si] === renderedBefore[ri]) { si++; ri++; }
+    else { si++; }
+  }
+  return Math.min(si, fallback);
+}
+
+function commitBlockEdit(blockId) {
+  const ta = document.querySelector(`textarea[data-block-id="${blockId}"]`);
+  if (!ta) {
+    editorState.editingBlockId = null;
+    return;
+  }
+  const newSource = ta.value;
+  const idx = editorState.blocks.findIndex(b => b.id === blockId);
+  if (idx < 0) {
+    editorState.editingBlockId = null;
+    renderBlocks();
+    return;
+  }
+  const old = editorState.blocks[idx];
+  editorState.editingBlockId = null;
+  if (newSource === old.source) {
+    renderBlocks();
+    return;
+  }
+  const before = editorState.source.slice(0, old.start);
+  const after = editorState.source.slice(old.end);
+  editorState.source = before + newSource + after;
+  editorState.blocks = tokenizeBlocks(editorState.source);
+  if (editorState.blocks.length === 0) {
+    editorState.blocks = [{
+      id: 'b' + (++editorState.blockSeq),
+      type: 'paragraph',
+      source: '',
+      start: 0,
+      end: 0,
+    }];
+  }
+  renderBlocks();
+  dirty = true;
+  scheduleSave();
+  updateWordCount();
+}
+
+function flushActiveBlockEdit() {
+  if (editorState.editingBlockId) commitBlockEdit(editorState.editingBlockId);
 }
 
 // ============================================================
@@ -242,18 +499,7 @@ function renderList() {
 
   emptyEl.classList.add('hidden');
 
-  const pinned = filtered.filter(n => n.pinned);
-  const others = filtered.filter(n => !n.pinned);
-  let html = '';
-  if (pinned.length > 0) {
-    html += `<div class="note-list-group-label">Pinned</div>`;
-    html += pinned.map(noteRowHTML).join('');
-  }
-  if (others.length > 0) {
-    html += `<div class="note-list-group-label">${pinned.length > 0 ? 'All notes' : 'Notes'}</div>`;
-    html += others.map(noteRowHTML).join('');
-  }
-  listEl.innerHTML = html;
+  listEl.innerHTML = filtered.map(noteRowHTML).join('');
 
   listEl.querySelectorAll('.note-row').forEach(row => {
     row.addEventListener('click', () => selectNote(row.dataset.id));
@@ -262,6 +508,81 @@ function renderList() {
       e.dataTransfer.effectAllowed = 'move';
     });
   });
+
+  renderSidebarPinned();
+}
+
+let lastPinnedKey = '';
+
+function renderSidebarPinned() {
+  const wrap = document.getElementById('sidebarPinned');
+  const list = document.getElementById('sidebarPinnedList');
+  if (!wrap || !list) return;
+
+  const pinned = notes.filter(n => n.pinned);
+  const key = pinned.map(n => `${n.id}\t${n.title || ''}`).join('\n') + '\0' + (selectedId || '');
+  if (key === lastPinnedKey) return;
+  lastPinnedKey = key;
+
+  if (pinned.length === 0) {
+    wrap.classList.add('hidden');
+    list.innerHTML = '';
+    return;
+  }
+  wrap.classList.remove('hidden');
+
+  list.innerHTML = pinned.map(n => {
+    const title = (n.title || '').trim() || 'Untitled';
+    const isActive = n.id === selectedId;
+    return `
+      <div class="sidebar-pinned-item ${isActive ? 'active' : ''}" data-id="${escapeAttr(n.id)}" title="${escapeAttr(title)}">
+        <span class="sidebar-pinned-title">${escapeHtml(title)}</span>
+        <button type="button" class="sidebar-pinned-unpin" title="Unpin" aria-label="Unpin">
+          <svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>`;
+  }).join('');
+
+  list.querySelectorAll('.sidebar-pinned-item').forEach(row => {
+    row.addEventListener('click', () => {
+      document.querySelector('.nav-item[data-view="notes"]')?.click();
+      selectNote(row.dataset.id);
+    });
+  });
+  list.querySelectorAll('.sidebar-pinned-unpin').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      unpinNoteById(btn.closest('.sidebar-pinned-item').dataset.id);
+    });
+  });
+}
+
+async function unpinNoteById(id) {
+  const note = notes.find(n => n.id === id);
+  if (!note?.pinned) return;
+  if (id === selectedId) {
+    await togglePin();
+    return;
+  }
+  try {
+    const updated = await invoke('update_note', {
+      id,
+      title: note.title,
+      body: note.body,
+      tags: note.tags || [],
+      pinned: false,
+      folder: note.folder ?? '',
+    });
+    const idx = notes.findIndex(n => n.id === id);
+    if (idx >= 0) notes[idx] = updated;
+    reindexNote(updated);
+    sortNotes();
+    renderList();
+  } catch (e) {
+    console.error('unpin error', e);
+  }
 }
 
 function noteRowHTML(n) {
@@ -289,20 +610,32 @@ function noteRowHTML(n) {
 }
 
 function renderTagFilters() {
+  const wrap = document.getElementById('tagFilterWrap');
   const container = document.getElementById('noteTagFilters');
-  const allTags = new Set();
-  notes.forEach(n => (n.tags || []).forEach(t => allTags.add(t)));
+  const sortBtn = document.getElementById('tagSortToggle');
 
-  if (allTags.size === 0) {
+  const counts = new Map();
+  notes.forEach(n => (n.tags || []).forEach(t => counts.set(t, (counts.get(t) || 0) + 1)));
+
+  if (counts.size === 0) {
+    wrap?.classList.add('hidden');
     container.innerHTML = '';
     return;
   }
+  wrap?.classList.remove('hidden');
+  if (sortBtn) sortBtn.title = tagSort === 'usage' ? 'Sorted by usage — click for A→Z' : 'Sorted A→Z — click for usage';
 
-  const sorted = [...allTags].sort();
+  const q = tagFilter.toLowerCase();
+  let entries = [...counts.entries()];
+  if (q) entries = entries.filter(([t]) => t.toLowerCase().includes(q));
+  entries.sort(tagSort === 'usage'
+    ? (a, b) => b[1] - a[1] || a[0].localeCompare(b[0])
+    : (a, b) => a[0].localeCompare(b[0]));
+
   container.innerHTML =
     `<button class="tag-chip ${activeTag === null ? 'active' : ''}" data-tag="">All</button>` +
-    sorted.map(t =>
-      `<button class="tag-chip ${activeTag === t ? 'active' : ''}" data-tag="${escapeAttr(t)}">${escapeHtml(t)}</button>`
+    entries.map(([t, c]) =>
+      `<button class="tag-chip ${activeTag === t ? 'active' : ''}" data-tag="${escapeAttr(t)}">${escapeHtml(t)}<span class="tag-chip-count">${c}</span></button>`
     ).join('');
 
   container.querySelectorAll('.tag-chip').forEach(chip => {
@@ -434,6 +767,20 @@ function buildFolderTree() {
   return root;
 }
 
+function computeVisibleFolderPaths(tree, q) {
+  const visible = new Set();
+  function walk(node, ancestors) {
+    for (const child of node.children.values()) {
+      const trail = [...ancestors, child];
+      const matches = child.path.toLowerCase().includes(q);
+      if (matches) trail.forEach(n => visible.add(n.path));
+      walk(child, trail);
+    }
+  }
+  walk(tree, []);
+  return visible;
+}
+
 function noteCountInFolder(path) {
   // Counts notes in `path` and all descendants.
   if (path === '') return notes.filter(n => !n.folder).length;
@@ -447,6 +794,9 @@ function renderFolderTree() {
   const container = document.getElementById('folderTree');
   if (!container) return;
   const tree = buildFolderTree();
+
+  const filterQ = folderFilter.toLowerCase();
+  const visiblePaths = filterQ ? computeVisibleFolderPaths(tree, filterQ) : null;
 
   const rows = [];
   const ICON_FOLDER = `<svg class="folder-row-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.379a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.12 5H12.5A1.5 1.5 0 0 1 14 6.5v5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5v-7Z" stroke="currentColor" stroke-width="1.3"/></svg>`;
@@ -481,10 +831,11 @@ function renderFolderTree() {
 
   function walk(node, ancestorIsLast) {
     if (node.children.size === 0) return;
-    const sorted = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+    let sorted = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
+    if (visiblePaths) sorted = sorted.filter(c => visiblePaths.has(c.path));
     sorted.forEach((child, idx) => {
       const isLast = idx === sorted.length - 1;
-      const collapsed = !!folderCollapsed.get(child.path);
+      const collapsed = visiblePaths ? false : !!folderCollapsed.get(child.path);
       const hasKids = child.children.size > 0;
       // Indent guides: one thin vertical line per ancestor whose subtree is
       // still continuing (i.e. that ancestor was NOT a last child).
@@ -1033,8 +1384,12 @@ async function selectNote(id, opts = { focus: true }) {
   populateEditor(note);
   showEditorPane();
   renderList();
-  if (opts.focus !== false) {
-    setTimeout(() => document.getElementById('noteBody').focus(), 0);
+  // Empty notes auto-enter edit mode on the first block so the user can type immediately.
+  if (opts.focus !== false && !(note.body || '').trim()) {
+    setTimeout(() => {
+      const first = editorState.blocks[0];
+      if (first) enterBlockEdit(first.id);
+    }, 0);
   }
 }
 
@@ -1042,11 +1397,10 @@ function populateEditor(note) {
   document.getElementById('noteTitle').value = note.title || '';
   editingTags = [...(note.tags || [])];
   renderTagPicker();
-  document.getElementById('noteBody').value = note.body || '';
+  loadNoteIntoEditor(note.body || '');
   const pinBtn = document.getElementById('pinBtn');
   pinBtn.setAttribute('aria-pressed', String(!!note.pinned));
   updateWordCount();
-  schedulePreviewRender();
   setSaveStatus('saved');
   lastSavedAt = note.updated_at || 0;
   updateSavedTimestamp();
@@ -1118,11 +1472,12 @@ async function deleteCurrent() {
 }
 
 function readEditor() {
+  flushActiveBlockEdit();
   return {
     title: document.getElementById('noteTitle').value.trim() || 'Untitled',
     tags: [...editingTags],
     pinned: document.getElementById('pinBtn').getAttribute('aria-pressed') === 'true',
-    body: document.getElementById('noteBody').value,
+    body: editorState.source,
   };
 }
 
@@ -1164,9 +1519,34 @@ function scheduleSave() {
 function onBodyInput() {
   if (!selectedId) return;
   dirty = true;
+  // Keep editorState.source live by splicing the active block's textarea into
+  // it, so save flushes/word counts mid-edit see fresh content.
+  syncActiveBlockToSource();
   scheduleSave();
   updateWordCount();
-  schedulePreviewRender();
+}
+
+function syncActiveBlockToSource() {
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  const block = findBlockById(editorState.editingBlockId);
+  if (!block) return;
+  const before = editorState.source.slice(0, block.start);
+  const after = editorState.source.slice(block.end);
+  const newVal = ta.value;
+  editorState.source = before + newVal + after;
+  // Update block.source / end without retokenizing — that happens on commit.
+  const delta = newVal.length - block.source.length;
+  block.source = newVal;
+  block.end = block.start + newVal.length;
+  // Shift subsequent blocks' offsets.
+  if (delta) {
+    const idx = editorState.blocks.indexOf(block);
+    for (let i = idx + 1; i < editorState.blocks.length; i++) {
+      editorState.blocks[i].start += delta;
+      editorState.blocks[i].end += delta;
+    }
+  }
 }
 
 function onMetaInput() {
@@ -1200,7 +1580,7 @@ function setSaveStatus(state) {
 }
 
 function updateWordCount() {
-  const body = document.getElementById('noteBody').value;
+  const body = editorState.source;
   const words = countWords(body);
   document.getElementById('wordCount').textContent = `${words} ${words === 1 ? 'word' : 'words'}`;
   const readingEl = document.getElementById('readingTime');
@@ -1250,42 +1630,8 @@ function startSavedRelativeTicker() {
 }
 
 // ============================================================
-// Live preview
+// Wiki-link decoration
 // ============================================================
-
-function schedulePreviewRender() {
-  if (!showPreview) return;
-  if (previewTimer) clearTimeout(previewTimer);
-  previewTimer = setTimeout(renderPreview, PREVIEW_DEBOUNCE_MS);
-}
-
-function renderPreview() {
-  const previewEl = document.getElementById('notePreview');
-  if (!previewEl) return;
-  const body = document.getElementById('noteBody').value;
-  const m = window.marked;
-  let parser = null;
-  if (m) {
-    if (typeof m.parse === 'function') parser = m.parse.bind(m);
-    else if (typeof m === 'function') parser = m;
-  }
-  if (!parser) {
-    previewEl.textContent = body;
-    return;
-  }
-  try {
-    if (typeof m.setOptions === 'function') {
-      m.setOptions({ breaks: true, gfm: true });
-    }
-    const raw = parser(body || '');
-    const clean = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
-    previewEl.innerHTML = clean;
-    decorateWikiLinks(previewEl);
-  } catch (e) {
-    console.error('marked parse error', e);
-    previewEl.textContent = body;
-  }
-}
 
 // Walks the rendered preview, replacing [[Title]] / [[Title|Display]] in text
 // nodes (skipping <code> and <pre>) with anchor elements. Resolution is
@@ -1375,17 +1721,13 @@ async function followWikiLink(target, knownId) {
     populateEditor(note);
     showEditorPane();
     renderList();
-    setTimeout(() => document.getElementById('noteBody').focus(), 0);
+    setTimeout(() => {
+      const first = editorState.blocks[0];
+      if (first) enterBlockEdit(first.id);
+    }, 0);
   } catch (e) {
     appAlert('Error creating note: ' + e, { title: 'Error' });
   }
-}
-
-function togglePreview() {
-  showPreview = !showPreview;
-  localStorage.setItem('notesShowPreview', showPreview ? '1' : '0');
-  applyPreviewState();
-  if (showPreview) renderPreview();
 }
 
 // ============================================================
@@ -1393,7 +1735,8 @@ function togglePreview() {
 // ============================================================
 
 function maybeOpenSlash() {
-  const ta = document.getElementById('noteBody');
+  const ta = getActiveTextarea();
+  if (!ta) return;
   const pos = ta.selectionStart;
   const text = ta.value;
   // `/` must be at start of line, or after whitespace.
@@ -1451,7 +1794,8 @@ function filterSlash(query) {
 function applySlashSelection() {
   if (slashFiltered.length === 0) { closeSlash(); return; }
   const item = slashFiltered[slashActiveIdx];
-  const ta = document.getElementById('noteBody');
+  const ta = getActiveTextarea();
+  if (!ta) { closeSlash(); return; }
 
   if (item.aiMode) {
     const slashStart = slashStartPos;
@@ -1469,11 +1813,14 @@ function applySlashSelection() {
   closeSlash();
   ta.focus();
   ta.setSelectionRange(caret, caret);
+  autosizeBlockTextarea(ta);
   onBodyInput();
 }
 
 function positionSlashMenu() {
-  positionFloatingMenu(document.getElementById('slashMenu'), slashStartPos, 240);
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  positionFloatingMenu(document.getElementById('slashMenu'), ta, slashStartPos, 240);
 }
 
 // Compute caret pixel coords inside a textarea using a hidden mirror element.
@@ -1514,9 +1861,8 @@ function getCaretCoords(textarea, position) {
 // Anchor a floating menu just below the caret in the notes textarea.
 // Flips above the line if it would overflow the viewport bottom; clamps to
 // horizontal viewport edges so it never half-renders off-screen.
-function positionFloatingMenu(menu, caretPos, menuWidth) {
-  if (!menu) return;
-  const ta = document.getElementById('noteBody');
+function positionFloatingMenu(menu, ta, caretPos, menuWidth) {
+  if (!menu || !ta) return;
   const taRect = ta.getBoundingClientRect();
   const cs = window.getComputedStyle(ta);
   const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
@@ -1572,89 +1918,123 @@ for (const item of SLASH_ITEMS) {
   }
 }
 
-// For rewrite/expand: returns the trailing paragraph (block separated from the
-// rest by a blank line) of `textBeforeSlash` — i.e. what the user just finished.
-function findPrecedingParagraph(textBeforeSlash) {
-  const trimmed = textBeforeSlash.replace(/[ \t\r\n]*$/, '');
-  if (!trimmed) return { start: 0, end: 0, text: '' };
-  const blocks = trimmed.split(/\n\s*\n/);
-  const last = blocks[blocks.length - 1] || '';
-  const start = trimmed.length - last.length;
-  return { start, end: trimmed.length, text: last };
-}
-
 async function runAiCommand(mode, slashStart, slashEnd) {
   if (aiRunning || !selectedId) return;
 
-  const ta = document.getElementById('noteBody');
-  const fullText = ta.value;
-  const beforeSlash = fullText.slice(0, slashStart);
-  const afterSlash = fullText.slice(slashEnd);
+  const activeBlockId = editorState.editingBlockId;
+  const activeBlock = activeBlockId ? findBlockById(activeBlockId) : null;
+  if (!activeBlock) {
+    flashAiLoaderError('Click into a block first');
+    return;
+  }
 
-  let inputText;
-  let replaceStart;
-  let replaceEnd;
-  let leadingPad = '';
+  // First: write any pending textarea edits back into editorState.source so
+  // the AI sees current content. This also rebuilds blocks/offsets.
+  syncActiveBlockToSource();
+
+  // Determine input text and the target block we'll stream into.
+  let inputText = '';
+  let targetBlockId;
+  let targetInitialSource = '';
 
   if (mode === 'summarize') {
-    inputText = (beforeSlash + afterSlash).trim();
+    inputText = editorState.source.trim();
     if (!inputText) {
       flashAiLoaderError('Note is empty — nothing to summarize');
       return;
     }
-    replaceStart = slashStart;
-    replaceEnd = slashEnd;
-    if (beforeSlash.length > 0 && !/\n\s*$/.test(beforeSlash)) {
-      leadingPad = '\n\n';
-    }
+    // Insert a new paragraph block right after the active block.
+    const idx = editorState.blocks.findIndex(b => b.id === activeBlockId);
+    const insertAt = editorState.blocks[idx].end;
+    const sep = editorState.source.slice(insertAt - 1, insertAt) === '\n' ? '\n' : '\n\n';
+    editorState.source =
+      editorState.source.slice(0, insertAt) + sep + editorState.source.slice(insertAt);
+    editorState.blocks = tokenizeBlocks(editorState.source);
+    // The new block will appear when streaming starts; pick a fresh id now.
+    const placeholderStart = insertAt + sep.length;
+    const newBlock = {
+      id: 'b' + (++editorState.blockSeq),
+      type: 'paragraph',
+      source: '',
+      start: placeholderStart,
+      end: placeholderStart,
+    };
+    // Find the right insert position in blocks array.
+    const insertBlockIdx = editorState.blocks.findIndex(b => b.start >= placeholderStart);
+    editorState.blocks.splice(
+      insertBlockIdx >= 0 ? insertBlockIdx : editorState.blocks.length,
+      0,
+      newBlock,
+    );
+    targetBlockId = newBlock.id;
+    targetInitialSource = '';
   } else {
-    const para = findPrecedingParagraph(beforeSlash);
-    if (!para.text.trim()) {
-      flashAiLoaderError(`No paragraph above to ${mode}`);
+    // rewrite/expand: target = the active block itself; replace its content.
+    inputText = activeBlock.source.trim();
+    if (!inputText) {
+      flashAiLoaderError(`Block is empty — nothing to ${mode}`);
       return;
     }
-    inputText = para.text;
-    replaceStart = para.start;
-    replaceEnd = slashEnd;
+    targetBlockId = activeBlockId;
+    targetInitialSource = '';
+    // Empty out the active block's source.
+    const before = editorState.source.slice(0, activeBlock.start);
+    const after = editorState.source.slice(activeBlock.end);
+    const delta = -activeBlock.source.length;
+    editorState.source = before + after;
+    activeBlock.source = '';
+    activeBlock.end = activeBlock.start;
+    const aIdx = editorState.blocks.indexOf(activeBlock);
+    for (let i = aIdx + 1; i < editorState.blocks.length; i++) {
+      editorState.blocks[i].start += delta;
+      editorState.blocks[i].end += delta;
+    }
   }
 
   const system = AI_SYSTEM_PROMPTS[mode];
   if (!system) return;
 
-  ta.value = ta.value.slice(0, replaceStart) + leadingPad + ta.value.slice(replaceEnd);
-  const insertAt = replaceStart + leadingPad.length;
-  let insertedLen = 0;
-
-  // Lock the textarea so user edits don't shift our insertion point mid-stream.
-  ta.readOnly = true;
+  // Render with the target block as the editing one (if it's the active block)
+  // or simply re-render to surface the new placeholder block.
+  editorState.editingBlockId = null;
+  renderBlocks();
   aiRunning = true;
   dirty = true;
-
-  ta.focus();
-  ta.setSelectionRange(insertAt, insertAt);
-  ta.scrollTop = Math.max(0, getCaretCoords(ta, insertAt).top - 40);
   showAiLoader(mode);
 
   let totalTokens = 0;
-
-  // Buffer deltas and flush once per animation frame. Per-token splices into a
-  // long textarea are O(N) each plus a forced reflow from setting scrollTop;
-  // batching keeps the cost amortized regardless of token rate.
   let pendingDelta = '';
   let rafScheduled = false;
+
   const flush = () => {
     rafScheduled = false;
     if (!pendingDelta) return;
-    const cursor = insertAt + insertedLen;
-    ta.value = ta.value.slice(0, cursor) + pendingDelta + ta.value.slice(cursor);
-    insertedLen += pendingDelta.length;
+    const target = findBlockById(targetBlockId);
+    if (!target) { pendingDelta = ''; return; }
+    // Splice into source, update target, shift trailing blocks.
+    const insertPos = target.end;
+    editorState.source =
+      editorState.source.slice(0, insertPos) + pendingDelta + editorState.source.slice(insertPos);
+    target.source += pendingDelta;
+    target.end = target.start + target.source.length;
+    const tIdx = editorState.blocks.indexOf(target);
+    const delta = pendingDelta.length;
     pendingDelta = '';
-    ta.scrollTop = ta.scrollHeight;
-    schedulePreviewRender();
+    for (let i = tIdx + 1; i < editorState.blocks.length; i++) {
+      editorState.blocks[i].start += delta;
+      editorState.blocks[i].end += delta;
+    }
+    // Replace just this one block's DOM rather than full re-render.
+    const wrap = document.querySelector(`[data-block-id="${targetBlockId}"]`);
+    const fresh = buildRenderedBlock(target);
+    if (wrap && wrap.parentNode) {
+      wrap.parentNode.replaceChild(fresh, wrap);
+      decorateWikiLinks(fresh.parentNode || fresh);
+      fresh.scrollIntoView({ block: 'nearest' });
+    }
   };
 
   const onEvent = new Channel();
-  let errored = false;
   onEvent.onmessage = (evt) => {
     if (evt.kind === 'chunk') {
       pendingDelta += evt.delta;
@@ -1665,7 +2045,6 @@ async function runAiCommand(mode, slashStart, slashEnd) {
         requestAnimationFrame(flush);
       }
     } else if (evt.kind === 'error') {
-      errored = true;
       flashAiLoaderError(evt.message || 'AI request failed');
     }
   };
@@ -1676,20 +2055,28 @@ async function runAiCommand(mode, slashStart, slashEnd) {
       opts: { system, temperature: 0.4 },
       onEvent,
     });
-    flush(); // drain any final buffered tokens
+    flush();
   } catch (e) {
     const msg = typeof e === 'string' ? e : (e?.message || String(e));
     flashAiLoaderError(msg);
   } finally {
     flush();
     hideAiLoader();
-    ta.readOnly = false;
     aiRunning = false;
-    const caret = insertAt + insertedLen;
-    ta.focus();
-    ta.setSelectionRange(caret, caret);
+    // Re-tokenize the document — the streamed text may have introduced new
+    // block boundaries that should be split out from the target block.
+    editorState.blocks = tokenizeBlocks(editorState.source);
+    if (editorState.blocks.length === 0) {
+      editorState.blocks = [{
+        id: 'b' + (++editorState.blockSeq),
+        type: 'paragraph',
+        source: '',
+        start: 0,
+        end: 0,
+      }];
+    }
+    renderBlocks();
     updateWordCount();
-    schedulePreviewRender();
     scheduleSave();
   }
 }
@@ -1777,12 +2164,12 @@ function flashAiLoaderError(message) {
 // ============================================================
 
 function maybeOpenWiki() {
-  const ta = document.getElementById('noteBody');
+  const ta = getActiveTextarea();
+  if (!ta) return;
   const pos = ta.selectionStart;
   if (pos < 2) return;
   const text = ta.value;
   if (text[pos - 1] !== '[' || text[pos - 2] !== '[') return;
-  // Don't trigger inside a fenced code block.
   if (insideCodeBlock(text, pos)) return;
   wikiStartPos = pos - 2;
   wikiActiveIdx = 0;
@@ -1843,10 +2230,10 @@ function renderWikiMenu() {
 function applyWikiSelection() {
   if (wikiResults.length === 0) { closeWiki(); return; }
   const item = wikiResults[wikiActiveIdx];
-  const ta = document.getElementById('noteBody');
+  const ta = getActiveTextarea();
+  if (!ta) { closeWiki(); return; }
   const before = ta.value.slice(0, wikiStartPos);
   const after = ta.value.slice(ta.selectionStart);
-  // Strip a trailing `]]` if the user typed it before picking.
   const cleanedAfter = after.replace(/^\]\]/, '');
   const insert = `[[${item.title}]]`;
   ta.value = before + insert + cleanedAfter;
@@ -1854,11 +2241,14 @@ function applyWikiSelection() {
   closeWiki();
   ta.focus();
   ta.setSelectionRange(caret, caret);
+  autosizeBlockTextarea(ta);
   onBodyInput();
 }
 
 function positionWikiMenu() {
-  positionFloatingMenu(document.getElementById('wikiMenu'), wikiStartPos, 280);
+  const ta = getActiveTextarea();
+  if (!ta) return;
+  positionFloatingMenu(document.getElementById('wikiMenu'), ta, wikiStartPos, 280);
 }
 
 // Returns true when `pos` falls inside a fenced code block (```...```).
@@ -2028,7 +2418,6 @@ function refreshPalette(query) {
   const q = (query || '').toLowerCase();
   const actions = [
     { kind: 'action', title: 'New note', run: () => { closePalette(); newNote(); } },
-    { kind: 'action', title: 'Toggle preview', run: () => { closePalette(); togglePreview(); } },
     { kind: 'action', title: 'Toggle notes list', run: () => { closePalette(); toggleListCollapsed(); } },
   ];
   if (selectedId) {
@@ -2131,17 +2520,37 @@ function bindEvents() {
     renderList();
   });
 
+  document.getElementById('folderFilterInput')?.addEventListener('input', e => {
+    folderFilter = e.target.value;
+    renderFolderTree();
+  });
+  document.getElementById('tagFilterInput')?.addEventListener('input', e => {
+    tagFilter = e.target.value;
+    renderTagFilters();
+  });
+  document.getElementById('tagSortToggle')?.addEventListener('click', () => {
+    tagSort = tagSort === 'usage' ? 'name' : 'usage';
+    localStorage.setItem('notesTagSort', tagSort);
+    renderTagFilters();
+  });
+
   document.getElementById('noteDeleteBtn').addEventListener('click', deleteCurrent);
   document.getElementById('pinBtn').addEventListener('click', togglePin);
-  document.getElementById('previewToggle').addEventListener('click', togglePreview);
   document.getElementById('listToggleBtn').addEventListener('click', toggleListCollapsed);
 
   document.getElementById('noteTitle').addEventListener('input', onMetaInput);
 
   const body = document.getElementById('noteBody');
-  body.addEventListener('input', onBodyInput);
+
+  // Delegated listeners: only fire when the event target is a block textarea.
+  body.addEventListener('input', e => {
+    if (!e.target.matches('textarea[data-block-id]')) return;
+    onBodyInput();
+    autosizeBlockTextarea(e.target);
+  });
 
   body.addEventListener('keydown', e => {
+    if (!e.target.matches('textarea[data-block-id]')) return;
     if (wikiOpen) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -2195,54 +2604,69 @@ function bindEvents() {
   });
 
   body.addEventListener('keyup', e => {
-    if (e.key === '[') {
-      maybeOpenWiki();
-      return;
-    }
-    if (e.key === '/') {
-      maybeOpenSlash();
-      return;
-    }
-    // Menu navigation keys are handled in keydown; don't let keyup
-    // re-run the query filter, which would reset the active index.
+    if (!e.target.matches('textarea[data-block-id]')) return;
+    if (e.key === '[') { maybeOpenWiki(); return; }
+    if (e.key === '/') { maybeOpenSlash(); return; }
     if ((slashOpen || wikiOpen) &&
         (e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
          e.key === 'Enter' || e.key === 'Escape' || e.key === 'Tab')) {
       return;
     }
+    const ta = e.target;
     if (wikiOpen) {
-      const ta = body;
-      if (ta.selectionStart < wikiStartPos + 2) {
-        closeWiki();
-        return;
-      }
+      if (ta.selectionStart < wikiStartPos + 2) { closeWiki(); return; }
       const query = ta.value.slice(wikiStartPos + 2, ta.selectionStart);
-      if (query.includes('\n') || query.includes(']')) {
-        closeWiki();
-        return;
-      }
+      if (query.includes('\n') || query.includes(']')) { closeWiki(); return; }
       refreshWiki(query);
       positionWikiMenu();
     }
     if (slashOpen) {
-      const ta = body;
-      if (ta.selectionStart < slashStartPos + 1) {
-        closeSlash();
-        return;
-      }
+      if (ta.selectionStart < slashStartPos + 1) { closeSlash(); return; }
       const query = ta.value.slice(slashStartPos + 1, ta.selectionStart);
-      if (/\s/.test(query) || query.includes('\n')) {
-        closeSlash();
-        return;
-      }
+      if (/\s/.test(query) || query.includes('\n')) { closeSlash(); return; }
       filterSlash(query);
       positionSlashMenu();
     }
+  }, true);  // capture so it runs even when menus reposition focus
+
+  // Block textarea blur → commit (with 120ms debounce so slash/wiki menu
+  // mousedown picks don't unmount the textarea before the click fires).
+  body.addEventListener('focusout', e => {
+    if (!e.target.matches('textarea[data-block-id]')) return;
+    const blockId = e.target.dataset.blockId;
+    setTimeout(() => {
+      closeSlash();
+      closeWiki();
+      // If focus returned to the same block textarea (e.g. menu pick), don't commit.
+      const active = document.activeElement;
+      if (active && active.matches?.(`textarea[data-block-id="${blockId}"]`)) return;
+      if (editorState.editingBlockId === blockId) commitBlockEdit(blockId);
+    }, 120);
   });
 
-  body.addEventListener('blur', () => {
-    // Slight delay so click on slash menu can register
-    setTimeout(() => { closeSlash(); closeWiki(); }, 120);
+  // Click on a non-editing block enters edit mode for that block.
+  body.addEventListener('click', e => {
+    // Wikilinks first — they take precedence and don't enter edit.
+    const a = e.target.closest('a');
+    if (a?.classList.contains('wikilink')) {
+      e.preventDefault();
+      followWikiLink(a.dataset.target || '', a.dataset.id || null);
+      return;
+    }
+    if (a) {
+      const href = a.getAttribute('href') || '';
+      if (/^https?:\/\//i.test(href)) {
+        e.preventDefault();
+        invoke('open_link_window', { url: href }).catch(err => console.error(err));
+      }
+      return;
+    }
+    // If click landed inside (or on) a non-editing block, enter edit for it.
+    const blockEl = e.target.closest('.nb-block');
+    if (!blockEl) return;
+    if (blockEl.matches('textarea')) return; // already editing this block
+    const id = blockEl.dataset.blockId;
+    if (id) enterBlockEdit(id, e.clientX, e.clientY);
   });
 
   // Notes list keyboard navigation when list is focused
@@ -2252,7 +2676,8 @@ function bindEvents() {
     else if (e.key === 'ArrowUp') { e.preventDefault(); navigateList(-1); }
     else if (e.key === 'Enter') {
       e.preventDefault();
-      document.getElementById('noteBody').focus();
+      const first = editorState.blocks[0];
+      if (first) enterBlockEdit(first.id);
     }
   });
 
@@ -2265,9 +2690,6 @@ function bindEvents() {
     } else if (meta && e.key === 'f') {
       e.preventDefault();
       document.getElementById('noteSearchInput').focus();
-    } else if (meta && e.key === '/') {
-      e.preventDefault();
-      togglePreview();
     } else if (meta && (e.key === '\\' || e.code === 'Backslash')) {
       e.preventDefault();
       toggleListCollapsed();
@@ -2296,14 +2718,6 @@ function bindEvents() {
       e.preventDefault();
       paletteResults[paletteActiveIdx]?.run();
     }
-  });
-
-  // Wiki-link clicks in preview
-  document.getElementById('notePreview').addEventListener('click', e => {
-    const a = e.target.closest('a.wikilink');
-    if (!a) return;
-    e.preventDefault();
-    followWikiLink(a.dataset.target || '', a.dataset.id || null);
   });
 
   // Backlinks collapse

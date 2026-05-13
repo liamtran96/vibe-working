@@ -15,6 +15,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   initGlobalShortcuts();
   initGlobalSettings();
 
+  loadNotesModule()
+    .then(m => m.initNotes())
+    .catch(err => console.error('Failed to pre-init notes', err));
+
   console.log('App initialized successfully');
 });
 

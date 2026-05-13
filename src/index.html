@@ -43,6 +43,15 @@
           <span>Chat</span>
         </button>
       </nav>
+      <div id="sidebarPinned" class="sidebar-pinned hidden">
+        <div class="sidebar-pinned-head">
+          <svg class="sidebar-pinned-head-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M9.5 1.5l5 5-2 .5-3 3 .5 2.5-1.5 1.5-3.5-3.5L1 14l3.5-4 -3.5-3.5L2.5 5l2.5.5 3-3 .5-2z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+          </svg>
+          <span>Pinned</span>
+        </div>
+        <div id="sidebarPinnedList" class="sidebar-pinned-list"></div>
+      </div>
       <div class="sidebar-foot">
         <button id="sidebarSettingsBtn" class="nav-item" title="Settings" aria-label="Settings">
           <span class="nav-icon" aria-hidden="true">
@@ -119,10 +128,18 @@
               <span>Folders</span>
               <button id="newFolderBtn" class="ghost-btn" title="New folder">+</button>
             </div>
+            <input type="text" id="folderFilterInput" class="tree-filter-input" placeholder="Filter folders…" autocomplete="off" />
             <div id="folderTree" class="folder-tree" role="tree"></div>
           </div>
 
-          <div id="noteTagFilters" class="tag-filter-row"></div>
+          <div id="tagFilterWrap" class="tag-filter-wrap hidden">
+            <div class="tag-filter-head">
+              <span>Tags</span>
+              <button id="tagSortToggle" class="ghost-btn" title="Sort by usage / name" aria-label="Toggle tag sort">↕</button>
+            </div>
+            <input type="text" id="tagFilterInput" class="tree-filter-input" placeholder="Filter tags…" autocomplete="off" />
+            <div id="noteTagFilters" class="tag-filter-row"></div>
+          </div>
 
           <div id="noteList" class="note-list" tabindex="0"></div>
           <div id="noteEmptyState" class="notes-list-empty hidden">
@@ -175,12 +192,6 @@
                       <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V5a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>
                     </svg>
                   </button>
-                  <button id="previewToggle" class="icon-btn" title="Toggle preview (Ctrl+/)">
-                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="3" y="3" width="18" height="18" rx="2"/>
-                      <path d="M12 3v18"/>
-                    </svg>
-                  </button>
                   <button id="noteDeleteBtn" class="icon-btn" title="Delete note">
                     <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M3 6h18"/>
@@ -192,10 +203,7 @@
                   </button>
               </div>
             </header>
-            <div id="editorSplit" class="editor-split">
-              <textarea id="noteBody" class="note-body" placeholder="Start writing… (type / for blocks, [[ to link)" spellcheck="false"></textarea>
-              <div id="notePreview" class="note-preview"></div>
-            </div>
+            <div id="noteBody" class="note-blocks" tabindex="-1"></div>
             <!-- Claude-Code-style loader bar: visible while an AI command runs -->
             <div id="aiLoader" class="ai-loader hidden" aria-live="polite">
               <span id="aiLoaderSpinner" class="ai-loader-spinner">⠋</span>

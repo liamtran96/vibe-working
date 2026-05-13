@@ -1217,6 +1217,26 @@ fn save_chat_to_disk(chat: &Chat) -> Result<(), String> {
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn open_link_window(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&url).map_err(|e| e.to_string())?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("Only http(s) URLs are allowed".to_string());
+    }
+    let title = parsed.host_str().unwrap_or("").to_string();
+    let label = format!("ext-{}", uuid_simple());
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::External(parsed))
+        .title(title)
+        .inner_size(1000.0, 720.0)
+        .min_inner_size(480.0, 360.0)
+        .center()
+        .resizable(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1262,6 +1282,7 @@ fn main() {
             create_chat,
             save_chat,
             delete_chat,
+            open_link_window,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
